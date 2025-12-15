@@ -5,7 +5,11 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+
+	"github.com/google/uuid"
 )
+
+var jobs = make(map[string]*Job)
 
 type EnqueueRequest struct {
 	Payload string `json:"payload"`
@@ -52,9 +56,18 @@ func main() {
 			return
 		}
 
-		log.Println("enqueued payload: ", req.Payload)
-		fmt.Fprintln(w, "ok")
+		var id string = uuid.NewString()
 
+		var job *Job = &Job{
+			ID:      id,
+			Payload: req.Payload,
+			State:   StateQueued,
+		}
+
+		jobs[id] = job
+
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"job_id":"%s"}`, id)
 	})
 
 	log.Println("Listening on port 8080")
