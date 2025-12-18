@@ -24,6 +24,11 @@ type EnqueueRequest struct {
 	Payload string `json:"payload"`
 }
 
+type AckRequest struct {
+	WorkerID string `json:"worker_id"`
+	JobID    string `json:"job_id"`
+}
+
 type JobState string
 
 const (
@@ -143,6 +148,52 @@ func main() {
 
 		//when no job available
 		w.WriteHeader(http.StatusNoContent)
+	})
+
+	http.HandleFunc("/ack", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req AckRequest
+		err := json.NewDecoder(r.Body).Decode(&req)
+		if err != nil || req.WorkerID == "" || req.JobID == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		jobsMu.Lock()
+		defer jobsMu.Unlock()
+
+		job, ok := jobs[req.JobID]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		if job.State == StateDone {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		if job.State != StateLeased || job.LeaseOwner != req.WorkerID {
+			w.WriteHeader(http.StatusConflict)
+			return
+		}
+
+		if job.LeaseExpiresAt <= time.Now().Unix() {
+			w.WriteHeader(http.StatusConflict)
+			return
+		}
+
+		//mark done
+		job.State = StateDone
+		job.LeaseOwner = ""
+		job.LeaseExpiresAt = 0
+
+		w.WriteHeader(http.StatusOK)
+
 	})
 
 	go func() {
