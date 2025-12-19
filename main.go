@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
 	"net/http"
 	"sync"
 	"time"
@@ -29,6 +30,11 @@ type AckRequest struct {
 	JobID    string `json:"job_id"`
 }
 
+type FailRequest struct {
+	WorkerID string `json:"worker_id"`
+	JobID    string `json:"job_id"`
+}
+
 type JobState string
 
 const (
@@ -48,8 +54,9 @@ type Job struct {
 	LeaseExpiresAt int64  `json:"lease_expires_at,omitempty"`
 
 	// Retry bookkeeping (we’ll use these in Week 1)
-	Attempts int `json:"attempts"`
-	MaxTries int `json:"max_tries"`
+	Attempts        int   `json:"attempts"`
+	MaxTries        int   `json:"max_tries"`
+	NextAvailableAt int64 `json:"next_available_at,omitempty"`
 }
 
 func expireLeases(now int64) []string {
@@ -63,11 +70,29 @@ func expireLeases(now int64) []string {
 			job.State = StateQueued
 			job.LeaseOwner = ""
 			job.LeaseExpiresAt = 0
+			job.NextAvailableAt = 0
 			expiredIDs = append(expiredIDs, id)
 		}
 	}
 
 	return expiredIDs
+}
+
+// exponential back off and jitter
+func retryDelaySeconds(attempts int) int64 {
+	if attempts < 1 {
+		attempts = 1
+	}
+
+	const base int64 = 2
+	const capDelay int64 = 30
+
+	delay := base << int64(attempts-1)
+	if delay > capDelay {
+		delay = capDelay
+	}
+
+	return rand.Int63n(delay + 1)
 }
 
 func main() {
@@ -134,11 +159,13 @@ func main() {
 		jobsMu.Lock()
 		defer jobsMu.Unlock()
 
+		now := time.Now().Unix()
+
 		for _, job := range jobs {
-			if job.State == StateQueued {
+			if job.State == StateQueued && (job.NextAvailableAt == 0 || job.NextAvailableAt <= now) {
 				job.State = StateLeased
 				job.LeaseOwner = req.WorkerID
-				job.LeaseExpiresAt = time.Now().Unix() + 30
+				job.LeaseExpiresAt = now + 30
 
 				w.Header().Set("Content-Type", "application/json")
 				json.NewEncoder(w).Encode(job)
@@ -191,6 +218,72 @@ func main() {
 		job.State = StateDone
 		job.LeaseOwner = ""
 		job.LeaseExpiresAt = 0
+
+		w.WriteHeader(http.StatusOK)
+
+	})
+
+	http.HandleFunc("/fail", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req FailRequest
+		err := json.NewDecoder(r.Body).Decode(&req)
+		if err != nil || req.WorkerID == "" || req.JobID == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		jobsMu.Lock()
+		defer jobsMu.Unlock()
+
+		job, ok := jobs[req.JobID]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		if job.State == StateDone {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		// Must be leased to this worker
+		if job.State != StateLeased || job.LeaseOwner != req.WorkerID {
+			w.WriteHeader(http.StatusConflict)
+			return
+		}
+
+		// Must not be expired
+		now := time.Now().Unix()
+		if job.LeaseExpiresAt <= now {
+			w.WriteHeader(http.StatusConflict)
+			return
+		}
+
+		// Record failure
+		job.Attempts++
+
+		// Too many tries => DEAD (DLQ behavior)
+		if job.Attempts >= job.MaxTries {
+			job.State = StateDead
+			job.LeaseOwner = ""
+			job.LeaseExpiresAt = 0
+			job.NextAvailableAt = 0
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		// Retry later with backoff + full jitter
+		delay := retryDelaySeconds(job.Attempts)
+		fmt.Println("retry scheduled:", job.ID, "attempts:", job.Attempts, "delay_s:", delay)
+
+		job.State = StateQueued
+		job.LeaseOwner = ""
+		job.LeaseExpiresAt = 0
+		job.NextAvailableAt = now + delay
 
 		w.WriteHeader(http.StatusOK)
 
