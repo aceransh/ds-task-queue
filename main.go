@@ -143,6 +143,26 @@ func main() {
 		json.NewEncoder(w).Encode(jobs)
 	})
 
+	http.HandleFunc("/dead", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		jobsMu.Lock()
+		defer jobsMu.Unlock()
+
+		dead := make(map[string]*Job)
+		for id, job := range jobs {
+			if job.State == StateDead {
+				dead[id] = job
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(dead)
+	})
+
 	http.HandleFunc("/poll", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
