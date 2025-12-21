@@ -114,18 +114,35 @@ func main() {
 		if idemKey != "" {
 			idemMu.Lock()
 			existingID, ok := idem[idemKey]
-			idemMu.Unlock()
 
-			if ok {
+			if ok && existingID != "PENDING" {
+				idemMu.Unlock()
 				w.Header().Set("Content-Type", "application/json")
 				fmt.Fprintf(w, `{"job_id":"%s"}`, existingID)
 				return
 			}
+
+			if ok && existingID == "PENDING" {
+				idemMu.Unlock()
+				w.WriteHeader(http.StatusConflict)
+				return
+			}
+
+			idem[idemKey] = "PENDING"
+			idemMu.Unlock()
 		}
 
 		var req EnqueueRequest
 		err := json.NewDecoder(r.Body).Decode(&req)
 		if err != nil {
+			if idemKey != "" {
+				idemMu.Lock()
+				if idem[idemKey] == "PENDING" {
+
+					delete(idem, idemKey)
+				}
+				idemMu.Unlock()
+			}
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
