@@ -5,6 +5,8 @@ This project is a **Distributed Task Queue** implemented in **Go** as part of my
 
 The task queue is designed to simulate a distributed system where producers enqueue jobs, workers process them, and the system handles retries, failures, and lease expirations. This project is a learning exercise and is not intended for production use.
 
+For a day-by-day build log and what I learned, see DEVLOG.md.
+
 ---
 
 ## Features Implemented
