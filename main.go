@@ -92,6 +92,7 @@ func retryDelaySeconds(attempts int) int64 {
 		delay = capDelay
 	}
 
+	fmt.Printf("Calculated delay (before jitter): %d for attempts: %d\n", delay, attempts)
 	return rand.Int63n(delay + 1)
 }
 
