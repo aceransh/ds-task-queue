@@ -137,8 +137,8 @@ func main() {
 		if err != nil {
 			if idemKey != "" {
 				idemMu.Lock()
-				if idem[idemKey] == "PENDING" {
-
+				existing, ok := idem[idemKey]
+				if ok && existing == "PENDING" {
 					delete(idem, idemKey)
 				}
 				idemMu.Unlock()

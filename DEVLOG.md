@@ -127,4 +127,44 @@ Retries must be **controlled**, not automatic. Backoff and DLQs are not optimiza
 
 ---
 
-## Day 5 — Idempotency (In Progress)
+## Day 5 — Idempotency & Exactly-Once Effects
+
+### Concepts Learned
+
+- Client retries are unavoidable due to timeouts and lost responses
+- Exactly-once *delivery* is unrealistic in distributed systems
+- Exactly-once *effects* can be achieved through idempotency
+- Idempotency requires atomic “check-and-claim” semantics
+- Concurrency can break idempotency without proper coordination
+
+### What I Built
+
+- Idempotent job creation using the `Idempotency-Key` request header
+- Mapping from idempotency key → job ID to deduplicate retries
+- Atomic reservation of idempotency keys using a `"PENDING"` marker
+- `409 Conflict` response when a duplicate request arrives while the original is still in progress
+- Safe cleanup of `"PENDING"` state on request failure
+- Retried requests return the original `job_id` without creating new jobs
+
+### Semantics & Guarantees
+
+- Repeated `/enqueue` requests with the same idempotency key return the **same `job_id`**
+- No duplicate jobs are created for the same logical client request
+- Concurrent duplicate requests are rejected with `409 Conflict`
+- The system provides **exactly-once effects for job creation**, not exactly-once execution
+
+**Contract:** Clients must not reuse an idempotency key for different logical requests. If reused with a different payload, the broker may still return the original `job_id` (lenient behavior).
+
+### Failure Testing
+
+- Retried `/enqueue` after response loss returns same `job_id`
+- Concurrent `/enqueue` requests with the same key result in:
+  - one successful job creation
+  - one or more `409 Conflict` responses
+- Verified that race conditions do not create duplicate jobs
+- Verified cleanup of idempotency state on malformed requests
+
+### Key Takeaway
+
+Distributed systems do not eliminate duplicates — they make duplicates **safe**.  
+By combining idempotency keys with atomic reservation, the system achieves exactly-once *effects* while preserving at-least-once delivery semantics.

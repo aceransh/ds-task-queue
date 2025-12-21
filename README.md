@@ -1,149 +1,190 @@
-# Distributed Task Queue in Go
+# Distributed Task Queue (Go)
 
 ## Overview
-This project is a **Distributed Task Queue** implemented in **Go** as part of my journey to learn **Distributed Systems** and **Go** through project-based learning. The goal of this project is to build a foundational understanding of distributed systems concepts such as **task queues**, **workers**, **leases**, **dead letter queues (DLQ)**, and **retry mechanisms** while applying Go's concurrency features like **goroutines**, **mutexes**, and **channels**.
 
-The task queue is designed to simulate a distributed system where producers enqueue jobs, workers process them, and the system handles retries, failures, and lease expirations. This project is a learning exercise and is not intended for production use.
+This project is a **Distributed Task Queue** implemented in **Go**, built to deeply understand core **distributed systems fundamentals** through hands-on implementation and failure testing.
 
-For a day-by-day build log and what I learned, see DEVLOG.md.
+The system models a real-world task queue (SQS / Celery–style) where:
 
----
+- producers enqueue jobs,
+- workers poll and process them,
+- and the system remains correct under crashes, retries, and partial failures.
 
-## Features Implemented
+The focus is on **correctness under failure**, not performance or production readiness.
 
-### 1. **Job Enqueuing**
-- Producers can enqueue jobs via the `/enqueue` endpoint.
-- Each job has:
-  - A unique ID.
-  - A payload (arbitrary data).
-  - A state (`QUEUED`, `LEASED`, `DONE`, or `DEAD`).
-  - Retry bookkeeping (e.g., `Attempts`, `MaxTries`).
-
-### 2. **Job Polling**
-- Workers can poll for jobs via the `/poll` endpoint.
-- Jobs in the `QUEUED` state are leased to workers for a fixed duration (30 seconds).
-- Leased jobs are assigned to a worker (`LeaseOwner`) and have a `LeaseExpiresAt` timestamp.
-
-### 3. **Acknowledging Job Completion**
-- Workers can acknowledge job completion via the `/ack` endpoint.
-- If the job is successfully processed, its state is updated to `DONE`.
-
-### 4. **Handling Job Failures**
-- Workers can report job failures via the `/fail` endpoint.
-- Failed jobs are retried with **exponential backoff and jitter**:
-  - The retry delay increases exponentially with the number of attempts.
-  - Jitter adds randomness to the delay to prevent synchronized retries (thundering herd problem).
-- Jobs that exceed the maximum retry attempts (`MaxTries`) are marked as `DEAD` and moved to the **Dead Letter Queue (DLQ)**.
-
-### 5. **Dead Letter Queue (DLQ)**
-- Jobs that fail repeatedly are moved to the DLQ.
-- The `/dead` endpoint allows inspection of jobs in the DLQ for debugging or manual intervention.
-
-### 6. **Lease Expiration**
-- If a worker fails to complete a job within the lease duration, the lease expires.
-- Expired jobs are returned to the `QUEUED` state, making them available for other workers to process.
-
-### 7. **Health Check**
-- A simple `/health` endpoint is available to verify that the server is running.
+For a day-by-day build log and design reasoning, see **DEVLOG.md**.
 
 ---
 
-## Technical Highlights
+## System Guarantees & Semantics
 
-### **Concurrency**
-- The task queue uses **goroutines** and a **time.Ticker** to periodically check for expired leases.
-- A **mutex (`sync.Mutex`)** ensures thread-safe access to the shared `jobs` map.
+### Delivery
 
-### **Retry Mechanism**
-- **Exponential Backoff with Jitter**:
-  - Delays between retries grow exponentially: \( 2^{\text{attempts} - 1} \).
-  - Jitter introduces randomness to avoid synchronized retries.
+- **At-least-once delivery**  
+  Jobs may be delivered more than once. This is intentional and required for fault tolerance.
 
-### **Dead Letter Queue**
-- Jobs that exceed the maximum retry attempts are marked as `DEAD` and can be inspected via the `/dead` endpoint.
+### Exactly-once Effects (Enqueue)
 
-### **HTTP Endpoints**
-- **`/enqueue`**: Add a new job to the queue.
-- **`/poll`**: Workers poll for jobs to process.
-- **`/ack`**: Workers acknowledge successful job completion.
-- **`/fail`**: Workers report job failures.
-- **`/dead`**: Inspect jobs in the Dead Letter Queue.
-- **`/health`**: Check server health.
+- **Idempotent enqueue via `Idempotency-Key`**
+  - Repeated `/enqueue` requests with the same idempotency key return the same `job_id`.
+  - Duplicate jobs are not created for the same logical request.
+  - Concurrent duplicate requests return `409 Conflict` while the original request is in progress.
 
----
+> The system does **not** guarantee exactly-once execution. Instead, it guarantees **exactly-once effects** for job creation.
 
-## Example Workflow
+### Leasing & Liveness
 
-1. **Enqueue a Job**:
-   - Send a POST request to `/enqueue` with a payload.
-   - The job is added to the queue in the `QUEUED` state.
+- Jobs are leased to workers for a fixed duration (30 seconds).
+- If a worker crashes or stalls, the lease expires and the job becomes visible again.
+- Liveness is prioritized over uniqueness.
 
-2. **Poll for a Job**:
-   - A worker sends a POST request to `/poll` with its `WorkerID`.
-   - The server leases a job to the worker, updating its state to `LEASED`.
+### Retries
 
-3. **Acknowledge or Fail the Job**:
-   - If the worker completes the job, it sends a POST request to `/ack`.
-   - If the worker fails to process the job, it sends a POST request to `/fail`.
-   - Failed jobs are retried with exponential backoff and jitter.
+- Failed jobs retry with **exponential backoff and full jitter** to prevent retry storms and thundering herd effects.
+- Jobs exceeding `MaxTries` are moved to a **Dead Letter Queue (DLQ)**.
 
-4. **Handle Dead Jobs**:
-   - Jobs that exceed the maximum retry attempts are moved to the DLQ.
-   - Inspect dead jobs via the `/dead` endpoint.
+### Dead Letter Queue (DLQ)
 
-5. **Lease Expiration**:
-   - If a worker does not complete a job within the lease duration, the lease expires.
-   - The job is returned to the `QUEUED` state for other workers to process.
+- Poison messages are isolated instead of retried indefinitely.
+- Dead jobs can be inspected via `/dead` for debugging or manual intervention.
+
+### Limitations (Explicit)
+
+- In-memory storage only — broker restarts lose state.
+- Single-node broker (distribution and replication are future work).
+- Workers must be idempotent to safely handle duplicate execution.
 
 ---
 
-## Future Enhancements
-- **Persistent Storage**: Replace the in-memory `jobs` map with a database to ensure durability.
-- **Worker Heartbeats**: Add a mechanism for workers to send periodic heartbeats to extend leases.
-- **Metrics and Monitoring**: Add metrics for job processing, retries, and failures.
-- **Support for Priority Queues**: Allow jobs to be processed based on priority levels.
+## Architecture Overview
+
+### Job States
+
+QUEUED → LEASED → DONE
+↘
+DEAD
+
+### Core Components
+
+- **Broker**: owns job state, leasing, retries, and failure handling
+- **Workers**: poll for jobs, process them, and acknowledge success or failure
+- **Lease Sweeper**: periodically re-queues expired leases
 
 ---
 
-## Why I Built This
-I wanted to gain a deeper understanding of distributed systems concepts and Go's concurrency model. By building this project, I learned how to:
-- Design and implement a task queue.
-- Handle concurrency and synchronization in Go.
-- Implement retry mechanisms with exponential backoff and jitter.
-- Manage job states and handle failures gracefully.
+## Implemented Features
 
-This project is a stepping stone in my journey to mastering distributed systems and Go.
+### Job Enqueuing (`/enqueue`)
+
+- Creates new jobs in the `QUEUED` state
+- Supports idempotent creation via `Idempotency-Key`
+- Returns a stable `job_id` for retries
+
+### Worker Polling (`/poll`)
+
+- Workers request jobs to process
+- Jobs are leased (not removed) to tolerate crashes
+- Only jobs eligible by retry delay are returned
+
+### Job Acknowledgement (`/ack`)
+
+- Workers explicitly acknowledge successful completion
+- Stale or invalid acknowledgements are rejected
+
+### Job Failure Handling (`/fail`)
+
+- Workers report failed processing attempts
+- Retries scheduled using exponential backoff + jitter
+- Jobs transition to `DEAD` after exceeding retry limit
+
+### Dead Letter Queue (`/dead`)
+
+- Lists jobs that permanently failed
+- Provides observability into poison messages
+
+### Lease Expiration
+
+- Background goroutine reclaims expired leases
+- Prevents job loss due to crashed or slow workers
+
+### Health Check (`/health`)
+
+- Simple liveness endpoint for monitoring
+
+---
+
+## Concurrency Model
+
+- Shared state protected by `sync.Mutex`
+- Explicit state transitions enforce correctness
+- Concurrency issues are treated as first-class failure modes
+
+---
+
+## HTTP API Summary
+
+| Endpoint | Method | Description |
+|--------|--------|-------------|
+| `/enqueue` | POST | Enqueue a job (idempotent) |
+| `/poll` | POST | Poll for a job to process |
+| `/ack` | POST | Acknowledge successful job |
+| `/fail` | POST | Report job failure |
+| `/dead` | GET | Inspect dead-lettered jobs |
+| `/jobs` | GET | Inspect all jobs (debug) |
+| `/health` | GET | Health check |
+
+---
+
+## Failure Scenarios Tested
+
+- Worker crashes mid-processing
+- Worker stalls beyond lease duration
+- Duplicate enqueue requests
+- Retry storms and poison messages
+- Stale acknowledgements
+- Concurrent access to shared state
+
+---
+
+## Why This Project
+
+This project was built to:
+
+- Understand **why** distributed systems are designed the way they are
+- Learn Go through real concurrency problems
+- Build something that can be confidently discussed in interviews
+
+It intentionally trades completeness for clarity and correctness.
 
 ---
 
 ## How to Run
-1. Install Go (if not already installed): [Download Go](https://go.dev/dl/).
-2. Clone this repository:
-   ```bash
-   git clone <repository-url>
-   cd ds-task-queue
-   ```
-3. Run the server:
-   ```bash
-   go run .
-   ```
-4. Use tools like `curl` or Postman to interact with the HTTP endpoints.
 
----
+```bash
+go run .
 
-## Endpoints Summary
+Use curl or Postman to interact with the API.
+```
 
-| **Endpoint**   | **Method** | **Description**                          |
-|-----------------|------------|------------------------------------------|
-| `/enqueue`      | POST       | Add a new job to the queue.              |
-| `/poll`         | POST       | Workers poll for jobs to process.        |
-| `/ack`          | POST       | Acknowledge successful job completion.   |
-| `/fail`         | POST       | Report job failure and trigger retries.  |
-| `/dead`         | GET        | Inspect jobs in the Dead Letter Queue.   |
-| `/jobs`         | GET        | View all jobs in the system.             |
-| `/health`       | GET        | Check if the server is running.          |
-
----
+⸻
 
 ## License
-This project is for educational purposes and is not intended for production use. Feel free to use it as a reference or learning resource.
+
+Educational use only. Not intended for production deployment.
+
+---
+
+## Why this version is better
+
+- Clearly separates **guarantees vs limitations**
+- Uses correct distributed systems language
+- Highlights idempotency, leases, retries, and DLQ (your strongest work)
+- Reads like a **systems design artifact**, not a tutorial
+
+If you want, next we can:
+
+- tighten it even more for **resume bullets**
+- add an **Architecture Diagram** section
+- or start **Day 6: fencing tokens / zombie worker protection**
+
+Just tell me what you want to tackle next.
