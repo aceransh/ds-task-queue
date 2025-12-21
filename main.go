@@ -15,6 +15,9 @@ import (
 var (
 	jobs   = make(map[string]*Job)
 	jobsMu sync.Mutex
+
+	idem   = make(map[string]string) //idem_key -> job_id
+	idemMu sync.Mutex
 )
 
 type PollRequest struct {
@@ -107,6 +110,19 @@ func main() {
 			return
 		}
 
+		idemKey := r.Header.Get("Idempotency-Key")
+		if idemKey != "" {
+			idemMu.Lock()
+			existingID, ok := idem[idemKey]
+			idemMu.Unlock()
+
+			if ok {
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprintf(w, `{"job_id":"%s"}`, existingID)
+				return
+			}
+		}
+
 		var req EnqueueRequest
 		err := json.NewDecoder(r.Body).Decode(&req)
 		if err != nil {
@@ -126,6 +142,12 @@ func main() {
 		jobsMu.Lock()
 		defer jobsMu.Unlock()
 		jobs[id] = job
+
+		if idemKey != "" {
+			idemMu.Lock()
+			idem[idemKey] = id
+			idemMu.Unlock()
+		}
 
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"job_id":"%s"}`, id)
