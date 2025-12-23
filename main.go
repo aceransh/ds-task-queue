@@ -31,11 +31,13 @@ type EnqueueRequest struct {
 type AckRequest struct {
 	WorkerID string `json:"worker_id"`
 	JobID    string `json:"job_id"`
+	LeaseID  int64  `json:"lease_id"`
 }
 
 type FailRequest struct {
 	WorkerID string `json:"worker_id"`
 	JobID    string `json:"job_id"`
+	LeaseID  int64  `json:"lease_id"`
 }
 
 type JobState string
@@ -52,11 +54,10 @@ type Job struct {
 	Payload string   `json:"payload"`
 	State   JobState `json:"state"`
 
-	// Lease info (used when a worker "owns" it temporarily)
 	LeaseOwner     string `json:"lease_owner,omitempty"`
 	LeaseExpiresAt int64  `json:"lease_expires_at,omitempty"`
+	LeaseID        int64  `json:"lease_id"`
 
-	// Retry bookkeeping (we’ll use these in Week 1)
 	Attempts        int   `json:"attempts"`
 	MaxTries        int   `json:"max_tries"`
 	NextAvailableAt int64 `json:"next_available_at,omitempty"`
@@ -226,6 +227,7 @@ func main() {
 				job.State = StateLeased
 				job.LeaseOwner = req.WorkerID
 				job.LeaseExpiresAt = now + 30
+				job.LeaseID++
 
 				w.Header().Set("Content-Type", "application/json")
 				json.NewEncoder(w).Encode(job)
@@ -265,6 +267,11 @@ func main() {
 		}
 
 		if job.State != StateLeased || job.LeaseOwner != req.WorkerID {
+			w.WriteHeader(http.StatusConflict)
+			return
+		}
+
+		if req.LeaseID != job.LeaseID {
 			w.WriteHeader(http.StatusConflict)
 			return
 		}
@@ -312,6 +319,11 @@ func main() {
 
 		// Must be leased to this worker
 		if job.State != StateLeased || job.LeaseOwner != req.WorkerID {
+			w.WriteHeader(http.StatusConflict)
+			return
+		}
+
+		if req.LeaseID != job.LeaseID {
 			w.WriteHeader(http.StatusConflict)
 			return
 		}

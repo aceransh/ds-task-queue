@@ -168,3 +168,58 @@ Retries must be **controlled**, not automatic. Backoff and DLQs are not optimiza
 
 Distributed systems do not eliminate duplicates — they make duplicates **safe**.  
 By combining idempotency keys with atomic reservation, the system achieves exactly-once *effects* while preserving at-least-once delivery semantics.
+
+## Day 6 — Zombie Workers & Fencing Tokens
+
+### Concepts Learned
+
+- Workers can become “zombies” due to pauses, crashes, or slow execution
+- Lease expiration alone is not sufficient to prevent stale workers from committing state
+- Time-based checks are vulnerable to race conditions
+- **Fencing tokens** (monotonically increasing lease versions) are required for correctness
+- The newest lease holder must be able to *fence out* all previous holders
+
+### The Zombie Worker Problem
+
+A subtle but critical failure scenario:
+
+1. Worker A leases a job and begins processing
+2. Worker A stalls (GC pause, CPU starvation, etc.)
+3. The lease expires and the job is re-queued
+4. Worker B leases the same job and begins processing
+5. Worker A resumes and attempts to ACK
+
+Without additional safeguards, **both workers believe they own the job**.  
+Accepting Worker A’s ACK would violate correctness and potentially cause duplicate side effects.
+
+### What I Built
+
+- Added a monotonically increasing `LeaseID` (fencing token) to each job
+- Incremented `LeaseID` on every successful `/poll` (new lease)
+- Returned `lease_id` to workers as part of the poll response
+- Required workers to include `lease_id` on `/ack` and `/fail`
+- Rejected ACK/FAIL requests when:
+  - the lease ID is stale
+  - the worker is not the current lease owner
+  - the lease has expired
+
+### Semantics & Guarantees
+
+- Only the worker holding the **current lease ID** may ACK or FAIL a job
+- Stale workers are explicitly rejected, even if they previously held the lease
+- Lease ownership is versioned, not just time-based
+- This prevents zombie workers from committing after lease reassignment
+
+### Failure Testing
+
+- Simulated worker stalls beyond lease expiration
+- Verified that:
+  - stale workers receive `409 Conflict`
+  - newly leased workers with the correct `lease_id` succeed
+- Confirmed that lease expiration + re-leasing increments `LeaseID`
+- Verified correct behavior under rapid poll/ack races
+
+### Key Takeaway
+
+Time-based leases alone are insufficient in distributed systems.  
+By introducing fencing tokens (`LeaseID`), the system guarantees that **only the most recent lease holder can mutate job state**, eliminating zombie worker races and preserving correctness under partial failures.
