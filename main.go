@@ -79,6 +79,12 @@ func expireLeases(now int64) []string {
 		}
 	}
 
+	for _, id := range expiredIDs {
+		logEvent("lease_expired", map[string]interface{}{
+			"job_id": id,
+		})
+	}
+
 	return expiredIDs
 }
 
@@ -88,7 +94,7 @@ func retryDelaySeconds(attempts int) int64 {
 		attempts = 1
 	}
 
-	const base int64 = 2
+	const base int64 = 5
 	const capDelay int64 = 30
 
 	delay := base << int64(attempts-1)
@@ -96,8 +102,15 @@ func retryDelaySeconds(attempts int) int64 {
 		delay = capDelay
 	}
 
-	fmt.Printf("Calculated delay (before jitter): %d for attempts: %d\n", delay, attempts)
 	return rand.Int63n(delay + 1)
+}
+
+func logEvent(event string, fields map[string]interface{}) {
+	msg := fmt.Sprintf("event=%s", event)
+	for k, v := range fields {
+		msg += fmt.Sprintf(" %s=%v", k, v)
+	}
+	log.Println(msg)
 }
 
 func main() {
@@ -167,6 +180,12 @@ func main() {
 			idemMu.Unlock()
 		}
 
+		logEvent("job_enqueued", map[string]interface{}{
+			"job_id":          id,
+			"payload_len":     len(job.Payload),
+			"idempotency_key": idemKey,
+		})
+
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"job_id":"%s"}`, id)
 	})
@@ -229,6 +248,13 @@ func main() {
 				job.LeaseExpiresAt = now + 30
 				job.LeaseID++
 
+				logEvent("job_leased", map[string]interface{}{
+					"job_id":           job.ID,
+					"worker_id":        req.WorkerID,
+					"lease_id":         job.LeaseID,
+					"lease_expires_at": job.LeaseExpiresAt,
+				})
+
 				w.Header().Set("Content-Type", "application/json")
 				json.NewEncoder(w).Encode(job)
 				return
@@ -267,16 +293,34 @@ func main() {
 		}
 
 		if job.State != StateLeased || job.LeaseOwner != req.WorkerID {
+			logEvent("ack_rejected", map[string]interface{}{
+				"job_id":      job.ID,
+				"reason":      "not_current_lease_owner",
+				"worker_id":   req.WorkerID,
+				"lease_owner": job.LeaseOwner,
+			})
 			w.WriteHeader(http.StatusConflict)
 			return
 		}
 
 		if req.LeaseID != job.LeaseID {
+			logEvent("ack_rejected", map[string]interface{}{
+				"job_id":           job.ID,
+				"reason":           "stale_lease_id",
+				"worker_lease_id":  req.LeaseID,
+				"current_lease_id": job.LeaseID,
+			})
 			w.WriteHeader(http.StatusConflict)
 			return
 		}
 
 		if job.LeaseExpiresAt <= time.Now().Unix() {
+			logEvent("ack_rejected", map[string]interface{}{
+				"job_id":           job.ID,
+				"reason":           "lease_expired",
+				"lease_expires_at": job.LeaseExpiresAt,
+				"now":              time.Now().Unix(),
+			})
 			w.WriteHeader(http.StatusConflict)
 			return
 		}
@@ -285,6 +329,12 @@ func main() {
 		job.State = StateDone
 		job.LeaseOwner = ""
 		job.LeaseExpiresAt = 0
+
+		logEvent("job_acked", map[string]interface{}{
+			"job_id":    job.ID,
+			"worker_id": req.WorkerID,
+			"lease_id":  req.LeaseID,
+		})
 
 		w.WriteHeader(http.StatusOK)
 
@@ -338,24 +388,42 @@ func main() {
 		// Record failure
 		job.Attempts++
 
+		logEvent("job_failed", map[string]interface{}{
+			"job_id":    job.ID,
+			"worker_id": req.WorkerID,
+			"lease_id":  req.LeaseID,
+			"attempts":  job.Attempts,
+		})
+
 		// Too many tries => DEAD (DLQ behavior)
 		if job.Attempts >= job.MaxTries {
 			job.State = StateDead
 			job.LeaseOwner = ""
 			job.LeaseExpiresAt = 0
 			job.NextAvailableAt = 0
+
+			logEvent("job_dead", map[string]interface{}{
+				"job_id":   job.ID,
+				"attempts": job.Attempts,
+			})
+
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 
 		// Retry later with backoff + full jitter
 		delay := retryDelaySeconds(job.Attempts)
-		fmt.Println("retry scheduled:", job.ID, "attempts:", job.Attempts, "delay_s:", delay)
 
 		job.State = StateQueued
 		job.LeaseOwner = ""
 		job.LeaseExpiresAt = 0
 		job.NextAvailableAt = now + delay
+
+		logEvent("job_retry_scheduled", map[string]interface{}{
+			"job_id":            job.ID,
+			"attempts":          job.Attempts,
+			"next_available_at": job.NextAvailableAt,
+		})
 
 		w.WriteHeader(http.StatusOK)
 
@@ -366,10 +434,7 @@ func main() {
 		defer ticker.Stop()
 
 		for range ticker.C {
-			ids := expireLeases(time.Now().Unix())
-			if len(ids) > 0 {
-				fmt.Println("expired lease: ", ids)
-			}
+			expireLeases(time.Now().Unix())
 		}
 	}()
 
