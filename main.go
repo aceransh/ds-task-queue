@@ -18,6 +18,8 @@ var (
 
 	idem   = make(map[string]string) //idem_key -> job_id
 	idemMu sync.Mutex
+
+	jobCond = sync.NewCond(&jobsMu)
 )
 
 type PollRequest struct {
@@ -173,6 +175,7 @@ func main() {
 		jobsMu.Lock()
 		defer jobsMu.Unlock()
 		jobs[id] = job
+		jobCond.Signal()
 
 		if idemKey != "" {
 			idemMu.Lock()
@@ -236,33 +239,52 @@ func main() {
 			return
 		}
 
+		timeout := 30 * time.Second
+		deadline := time.Now().Add(timeout)
+
 		jobsMu.Lock()
 		defer jobsMu.Unlock()
 
-		now := time.Now().Unix()
+		for {
+			now := time.Now().Unix()
 
-		for _, job := range jobs {
-			if job.State == StateQueued && (job.NextAvailableAt == 0 || job.NextAvailableAt <= now) {
-				job.State = StateLeased
-				job.LeaseOwner = req.WorkerID
-				job.LeaseExpiresAt = now + 30
-				job.LeaseID++
+			for _, job := range jobs {
+				if job.State == StateQueued && (job.NextAvailableAt == 0 || job.NextAvailableAt <= now) {
+					job.State = StateLeased
+					job.LeaseOwner = req.WorkerID
+					job.LeaseExpiresAt = now + 30
+					job.LeaseID++
 
-				logEvent("job_leased", map[string]interface{}{
-					"job_id":           job.ID,
-					"worker_id":        req.WorkerID,
-					"lease_id":         job.LeaseID,
-					"lease_expires_at": job.LeaseExpiresAt,
-				})
+					logEvent("job_leased", map[string]interface{}{
+						"job_id":           job.ID,
+						"worker_id":        req.WorkerID,
+						"lease_id":         job.LeaseID,
+						"lease_expires_at": job.LeaseExpiresAt,
+					})
 
-				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(job)
+					w.Header().Set("Content-Type", "application/json")
+					json.NewEncoder(w).Encode(job)
+					return
+				}
+			}
+
+			//when no job available
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				w.WriteHeader(http.StatusNoContent)
 				return
 			}
-		}
 
-		//when no job available
-		w.WriteHeader(http.StatusNoContent)
+			timer := time.AfterFunc(remaining, func() {
+				jobsMu.Lock()
+				jobCond.Signal()
+				jobsMu.Unlock()
+			})
+
+			jobCond.Wait()
+			timer.Stop()
+
+		}
 	})
 
 	http.HandleFunc("/ack", func(w http.ResponseWriter, r *http.Request) {

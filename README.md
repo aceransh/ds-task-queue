@@ -80,12 +80,6 @@ DEAD
 - Supports idempotent creation via `Idempotency-Key`
 - Returns a stable `job_id` for retries
 
-### Worker Polling (`/poll`)
-
-- Workers request jobs to process
-- Jobs are leased (not removed) to tolerate crashes
-- Only jobs eligible by retry delay are returned
-
 ### Job Acknowledgement (`/ack`)
 
 - Workers explicitly acknowledge successful completion
@@ -111,6 +105,19 @@ DEAD
 
 - Simple liveness endpoint for monitoring
 
+### Long Polling (`/poll`)
+
+- Workers may long-poll for jobs for up to **30 seconds**
+- If a job is immediately available, it is returned right away
+- If no jobs are available:
+  - the request blocks
+  - and returns `204 No Content` after the timeout
+- If a job becomes available while polling:
+  - the request returns immediately with a leased job
+
+This reduces unnecessary polling traffic and mirrors production queue behavior
+(e.g., AWS SQS long polling).
+
 ---
 
 ## Concurrency Model
@@ -126,7 +133,7 @@ DEAD
 | Endpoint | Method | Description |
 |--------|--------|-------------|
 | `/enqueue` | POST | Enqueue a job (idempotent) |
-| `/poll` | POST | Poll for a job to process |
+| `/poll` | POST | Poll for a job (supports long polling) |
 | `/ack` | POST | Acknowledge successful job |
 | `/fail` | POST | Report job failure |
 | `/dead` | GET | Inspect dead-lettered jobs |
@@ -135,14 +142,45 @@ DEAD
 
 ---
 
+## Failure Harness
+
+The system includes a lightweight failure harness used to validate correctness
+under real failure conditions.
+
+The harness simulates:
+
+- high-rate job enqueuing
+- multiple concurrent workers
+- worker crashes and stalls
+- broker restarts
+
+### Test Workflow
+
+1. Enqueue a large volume of jobs
+2. Run multiple workers that randomly:
+   - acknowledge jobs
+   - fail jobs
+   - hang mid-processing (simulate crashes)
+3. Restart the broker mid-flight
+4. Observe:
+   - lease expiration
+   - job re-delivery
+   - retry behavior
+   - dead-letter transitions
+
+All correctness guarantees are validated through **observable state transitions**
+rather than mocks or unit tests.
+
 ## Failure Scenarios Tested
 
 - Worker crashes mid-processing
 - Worker stalls beyond lease duration
-- Duplicate enqueue requests
+- Broker restart (in-memory state loss)
+- Duplicate enqueue requests (idempotency)
 - Retry storms and poison messages
 - Stale acknowledgements
-- Concurrent access to shared state
+- Concurrent workers contending for jobs
+- Jobs re-delivered after lease expiration
 
 ---
 
@@ -153,6 +191,7 @@ This project was built to:
 - Understand **why** distributed systems are designed the way they are
 - Learn Go through real concurrency problems
 - Build something that can be confidently discussed in interviews
+- Demonstrate understanding of **network-efficient queue design** via long polling
 
 It intentionally trades completeness for clarity and correctness.
 

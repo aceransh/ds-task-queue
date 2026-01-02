@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 BROKER_URL="http://localhost:8080"
 WORKER_ID="${1:-worker-1}"
 

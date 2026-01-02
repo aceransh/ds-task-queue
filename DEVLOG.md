@@ -223,3 +223,127 @@ Accepting Worker A’s ACK would violate correctness and potentially cause dupli
 
 Time-based leases alone are insufficient in distributed systems.  
 By introducing fencing tokens (`LeaseID`), the system guarantees that **only the most recent lease holder can mutate job state**, eliminating zombie worker races and preserving correctness under partial failures.
+
+---
+
+## Day 7 — Observability, Failure Harness, and Long Polling
+
+### Concepts Learned
+
+- Correctness in distributed systems must be **observable**
+- Logs are a first-class correctness tool, not just debugging output
+- Failure testing is more valuable than unit testing for distributed systems
+- Broker restarts are a *designed-for failure*, not an edge case
+- Naive polling is inefficient and wasteful at scale
+- Long polling is a fundamental optimization used by real queues (e.g., SQS)
+
+---
+
+### What I Built
+
+#### Structured Logging Improvements
+
+- Standardized log events for all state transitions:
+  - job_enqueued
+  - job_leased
+  - job_acked
+  - job_failed
+  - job_retry_scheduled
+  - lease_expired
+- Logs consistently include:
+  - `job_id`
+  - `worker_id` (when applicable)
+  - `lease_id`
+  - timing metadata (lease expiration, retry delay)
+- This allows correctness to be verified purely from logs without stepping through code
+
+---
+
+#### Failure Harness
+
+Built a lightweight failure harness using shell scripts and multiple worker processes
+to intentionally induce real-world failure scenarios.
+
+The harness simulates:
+
+- High-volume job enqueue (“spam enqueue”)
+- Multiple concurrent workers
+- Random ACK / FAIL behavior
+- Workers that hang mid-job (simulating crashes or pauses)
+- Broker restart mid-flight
+
+This allowed validation of system behavior under:
+
+- partial execution
+- duplicate delivery
+- stale acknowledgements
+- retry storms
+- lease expiration races
+
+Correctness was verified by inspecting logs and job state transitions
+rather than relying on mock-based tests.
+
+---
+
+#### Broker Restart Semantics
+
+- The broker uses an in-memory job store
+- Restarting the broker **intentionally resets all state**
+- This was explicitly tested by:
+  - enqueueing jobs
+  - leasing jobs
+  - killing the broker
+  - restarting and verifying empty state
+
+This clarified an important distinction:
+
+- **Durability is orthogonal to correctness**
+- The system is correct *within a process lifetime*
+- Persistence (WAL / DB) would be an additive concern, not a redesign
+
+---
+
+#### Long Polling (`/poll`)
+
+Extended the worker polling mechanism to support **long polling**:
+
+- `/poll` may block up to ~30 seconds if no jobs are immediately available
+- Returns immediately if a job becomes available during the wait
+- Returns `204 No Content` on timeout
+
+This change:
+
+- Reduces unnecessary polling traffic
+- Improves efficiency under low-load conditions
+- Mirrors real production queue designs (SQS-style polling)
+
+The implementation was intentionally kept simple to avoid overengineering.
+
+---
+
+### Failure Scenarios Tested
+
+- Worker crash mid-processing
+- Worker stalls beyond lease duration
+- Stale ACK / FAIL from zombie workers
+- Concurrent workers contending for the same job
+- Retry storms with backoff and jitter
+- Poison messages transitioning to DEAD
+- Duplicate enqueue requests (idempotency)
+- Broker restart with in-flight work
+- Long polling timeout vs immediate delivery
+
+---
+
+### Key Takeaway
+
+Correctness in distributed systems is not proven by happy-path tests.
+It is proven by:
+
+- explicit state machines
+- observable transitions
+- and aggressive failure testing
+
+By the end of Day 7, the system behaves predictably under crashes,
+timeouts, retries, duplicates, and restarts — which is the real goal
+of distributed systems design.
