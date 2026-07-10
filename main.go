@@ -78,6 +78,7 @@ func expireLeases(now int64) []string {
 			job.LeaseExpiresAt = 0
 			job.NextAvailableAt = 0
 			expiredIDs = append(expiredIDs, id)
+			jobCond.Signal()
 		}
 	}
 
@@ -104,10 +105,10 @@ func retryDelaySeconds(attempts int) int64 {
 		delay = capDelay
 	}
 
-	return rand.Int63n(delay + 1)
+	return rand.Int63n(delay + 1) //random delay between 0 and delay
 }
 
-func logEvent(event string, fields map[string]interface{}) {
+func logEvent(event string, fields map[string]any) {
 	msg := fmt.Sprintf("event=%s", event)
 	for k, v := range fields {
 		msg += fmt.Sprintf(" %s=%v", k, v)
@@ -193,39 +194,6 @@ func main() {
 		fmt.Fprintf(w, `{"job_id":"%s"}`, id)
 	})
 
-	http.HandleFunc("/jobs", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-
-		jobsMu.Lock()
-		defer jobsMu.Unlock()
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(jobs)
-	})
-
-	http.HandleFunc("/dead", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-
-		jobsMu.Lock()
-		defer jobsMu.Unlock()
-
-		dead := make(map[string]*Job)
-		for id, job := range jobs {
-			if job.State == StateDead {
-				dead[id] = job
-			}
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(dead)
-	})
-
 	http.HandleFunc("/poll", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -309,12 +277,12 @@ func main() {
 			return
 		}
 
-		if job.State == StateDone {
+		if job.State == StateDone { //already been acked
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 
-		if job.State != StateLeased || job.LeaseOwner != req.WorkerID {
+		if job.State != StateLeased || job.LeaseOwner != req.WorkerID { //if either the state isn't leased or the leaseowner doesn't match the worker id from the request
 			logEvent("ack_rejected", map[string]interface{}{
 				"job_id":      job.ID,
 				"reason":      "not_current_lease_owner",
@@ -325,7 +293,7 @@ func main() {
 			return
 		}
 
-		if req.LeaseID != job.LeaseID {
+		if req.LeaseID != job.LeaseID { //if the leased ids don't match
 			logEvent("ack_rejected", map[string]interface{}{
 				"job_id":           job.ID,
 				"reason":           "stale_lease_id",
@@ -336,7 +304,7 @@ func main() {
 			return
 		}
 
-		if job.LeaseExpiresAt <= time.Now().Unix() {
+		if job.LeaseExpiresAt <= time.Now().Unix() { //if the job has already expired we can't let a worker /ack it
 			logEvent("ack_rejected", map[string]interface{}{
 				"job_id":           job.ID,
 				"reason":           "lease_expired",
@@ -389,7 +357,7 @@ func main() {
 			return
 		}
 
-		// Must be leased to this worker
+		// Must be leased to this worker and has to be in the leased state
 		if job.State != StateLeased || job.LeaseOwner != req.WorkerID {
 			w.WriteHeader(http.StatusConflict)
 			return
@@ -449,6 +417,39 @@ func main() {
 
 		w.WriteHeader(http.StatusOK)
 
+	})
+
+	http.HandleFunc("/jobs", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		jobsMu.Lock()
+		defer jobsMu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(jobs)
+	})
+
+	http.HandleFunc("/dead", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		jobsMu.Lock()
+		defer jobsMu.Unlock()
+
+		dead := make(map[string]*Job)
+		for id, job := range jobs {
+			if job.State == StateDead {
+				dead[id] = job
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(dead)
 	})
 
 	go func() {

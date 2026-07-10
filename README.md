@@ -212,18 +212,3 @@ Use curl or Postman to interact with the API.
 Educational use only. Not intended for production deployment.
 
 ---
-
-## Why this version is better
-
-- Clearly separates **guarantees vs limitations**
-- Uses correct distributed systems language
-- Highlights idempotency, leases, retries, and DLQ (your strongest work)
-- Reads like a **systems design artifact**, not a tutorial
-
-If you want, next we can:
-
-- tighten it even more for **resume bullets**
-- add an **Architecture Diagram** section
-- or start **Day 6: fencing tokens / zombie worker protection**
-
-Just tell me what you want to tackle next.
