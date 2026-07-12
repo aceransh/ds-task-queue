@@ -1,0 +1,10 @@
+services:
+  my-database:
+    image: postgres:15.0
+    environment:
+      - POSTGRES_PASSWORD=db_password
+      - POSTGRES_DB=myDB
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./sql/schema.sql:/docker-entrypoint-initdb.d/init.sql

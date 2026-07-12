@@ -10,6 +10,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"database/sql"
+
+	_ "github.com/lib/pq"
 )
 
 var (
@@ -20,6 +24,8 @@ var (
 	idemMu sync.Mutex
 
 	jobCond = sync.NewCond(&jobsMu)
+
+	db *sql.DB
 )
 
 type PollRequest struct {
@@ -63,6 +69,21 @@ type Job struct {
 	Attempts        int   `json:"attempts"`
 	MaxTries        int   `json:"max_tries"`
 	NextAvailableAt int64 `json:"next_available_at,omitempty"`
+}
+
+func initDB() {
+	var err error
+	db, err = sql.Open("postgres", "host=localhost port=5432 user=postgres password=db_password dbname=myDB sslmode=disable")
+	if err != nil {
+		log.Fatal("failed to open db: ", err)
+	}
+
+	err = db.Ping()
+	if err != nil {
+		log.Fatal("Failed to ping db: ", err)
+	}
+
+	log.Println("Successfully connected to the database!")
 }
 
 func expireLeases(now int64) []string {
@@ -117,6 +138,8 @@ func logEvent(event string, fields map[string]any) {
 }
 
 func main() {
+	initDB()
+
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, "ok")
 	})

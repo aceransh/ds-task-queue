@@ -347,3 +347,33 @@ It is proven by:
 By the end of Day 7, the system behaves predictably under crashes,
 timeouts, retries, duplicates, and restarts — which is the real goal
 of distributed systems design.
+
+## Day 8 — Relational Schemas & Docker Infrastructure
+
+### Concepts Learned
+
+* Strong typing in relational databases vs. flexible in-memory maps (e.g., handling the `"PENDING"` state dilemma in SQL).
+* Time representations in databases (avoiding Y2K38 by mapping Go's `int64` to Postgres `BIGINT`).
+* Docker fundamentals: Containerization ensures reproducible infrastructure across different environments ("it works on my machine" is no longer an excuse).
+* Docker Compose: Using YAML to define and orchestrate local infrastructure.
+* Go's `database/sql` package acts as a generic interface and requires a specific driver (like `[github.com/lib/pq](https://github.com/lib/pq)`) to communicate with Postgres.
+* `sql.Open` only validates the connection string format; a physical `Ping()` is required to verify actual database reachability.
+
+### What I Built
+
+* Translated the in-memory `Job` struct and `idem` map into strict PostgreSQL `CREATE TABLE` definitions.
+* Utilized Postgres `ENUM` types for job states and `UUID` for primary keys.
+* Set up a `./sql/schema.sql` file and mapped it to Docker's `/docker-entrypoint-initdb.d/` volume for automatic database initialization.
+* Wrote a `docker-compose.yml` file to provision a local PostgreSQL 15 server.
+* Implemented `initDB()` in `main.go` to establish and verify the connection between the Go broker and the Dockerized database.
+
+### The Struggle & Troubleshooting
+
+* Navigated strict YAML syntax rules (e.g., ensuring port mappings like `"5432:5432"` are quoted to prevent parser errors).
+* Encountered the classic "Ghost Database" port conflict. The Go application threw a `role "postgres" does not exist` error despite Docker running perfectly.
+* Investigated container logs using `docker compose logs` and learned to cleanly wipe volume state using `docker compose down -v`.
+* Discovered that a native MacOS background process was hogging port 5432 and intercepting the Go connection before it could reach the Docker container. Resolved by killing the local background service to clear the port.
+
+### Key Takeaway
+
+Infrastructure as code is just as unforgiving as application logic. Moving from in-memory state to a durable database introduces entirely new failure domains—from strict type enforcement to networking and port binding conflicts. A bulletproof application still fails if the infrastructure beneath it is misconfigured.
