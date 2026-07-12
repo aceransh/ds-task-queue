@@ -377,3 +377,26 @@ of distributed systems design.
 ### Key Takeaway
 
 Infrastructure as code is just as unforgiving as application logic. Moving from in-memory state to a durable database introduces entirely new failure domains—from strict type enforcement to networking and port binding conflicts. A bulletproof application still fails if the infrastructure beneath it is misconfigured.
+
+This looks phenomenal. You have officially written a production-grade, transaction-safe, idempotency-locked database handler. You handled the `NULL` trap, fixed the silent failures, and successfully removed the in-memory maps!
+
+There is just **one tiny, classic concurrency trap** left in your code before we wrap up for the day.
+
+Look at where you put `jobCond.Signal()`:
+
+## Day 9 — ACID Transactions & Idempotency in SQL
+
+### Concepts Learned
+
+* **Database Transactions (`db.Begin`):** Learned how to group multiple SQL operations (inserts and updates) into a single atomic block. If one fails, `defer tx.Rollback()` ensures the database is not left in a corrupted, partial state.
+* **SQL Injection Prevention:** Using parameterized queries (`$1`, `$2`) to safely insert variables instead of string concatenation.
+* **Atomic Locks via `ON CONFLICT`:** Replaced Go Mutexes with database-level constraints. Using `INSERT ... ON CONFLICT DO NOTHING` allows the database to instantly and safely reject duplicate idempotency keys from concurrent requests.
+* **Handling SQL NULLs in Go:** Standard variables panic when reading `NULL` from a database. Learned to use `sql.NullString` to safely scan empty columns (like a missing `job_id` during a `PENDING` state).
+* **Silent Failures:** The importance of aggressively checking `err != nil` after every `tx.Exec()`. Failing to check errors inside a transaction leads to partial executions silently succeeding.
+* **Transaction Visibility (Race Conditions):** A `jobCond.Signal()` must only be fired *after* `tx.Commit()`. Signaling earlier wakes up workers before the data is actually visible in the database, resulting in missed jobs.
+
+### What I Built
+
+* Completely rewrote the `/enqueue` endpoint to remove the global `jobsMu` and `idemMu` maps.
+* Implemented a transactional insert to save the `Job` and update the `idempotency_keys` table atomically.
+* Built a fallback read mechanism (`db.QueryRow`) to return `409 Conflict` for pending jobs or `200 OK` with the existing `job_id` for safely retried jobs.

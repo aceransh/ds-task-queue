@@ -9,10 +9,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
-
 	"database/sql"
 
+	"github.com/google/uuid"
 	_ "github.com/lib/pq"
 )
 
@@ -152,64 +151,88 @@ func main() {
 
 		idemKey := r.Header.Get("Idempotency-Key")
 		if idemKey != "" {
-			idemMu.Lock()
-			existingID, ok := idem[idemKey]
+			// 1. Try to lock the key by inserting PENDING
+			result, err := db.Exec(`
+				INSERT INTO idempotency_keys (idem_key, status) 
+				VALUES ($1, 'PENDING') 
+				ON CONFLICT (idem_key) DO NOTHING;
+			`, idemKey)
+			if err != nil {
+				log.Println("Insert idempotency error:", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
 
-			if ok && existingID != "PENDING" {
-				idemMu.Unlock()
+			rows, _ := result.RowsAffected()
+
+			// 2. If rows == 0, the key already existed. We need to check its status.
+			if rows == 0 {
+				var status string
+				var existingJobID sql.NullString // Safely handles NULLs!
+
+				err := db.QueryRow("SELECT status, job_id FROM idempotency_keys WHERE idem_key = $1", idemKey).Scan(&status, &existingJobID)
+				if err != nil {
+					log.Println("Query idempotency error:", err)
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+
+				if status == "PENDING" {
+					w.WriteHeader(http.StatusConflict)
+					return
+				}
+
+				// It must be COMPLETED, so return the existing job ID
 				w.Header().Set("Content-Type", "application/json")
-				fmt.Fprintf(w, `{"job_id":"%s"}`, existingID)
+				fmt.Fprintf(w, `{"job_id":"%s"}`, existingJobID.String)
 				return
 			}
-
-			if ok && existingID == "PENDING" {
-				idemMu.Unlock()
-				w.WriteHeader(http.StatusConflict)
-				return
-			}
-
-			idem[idemKey] = "PENDING"
-			idemMu.Unlock()
 		}
 
 		var req EnqueueRequest
 		err := json.NewDecoder(r.Body).Decode(&req)
 		if err != nil {
-			if idemKey != "" {
-				idemMu.Lock()
-				existing, ok := idem[idemKey]
-				if ok && existing == "PENDING" {
-					delete(idem, idemKey)
-				}
-				idemMu.Unlock()
-			}
+			log.Println("Request error: ", err)
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
 
 		var id string = uuid.NewString()
 
-		var job *Job = &Job{
-			ID:       id,
-			Payload:  req.Payload,
-			State:    StateQueued,
-			MaxTries: 3,
+		tx, err := db.Begin()
+		if err != nil {
+			log.Println("Error with db.Begin(): ", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
+		defer tx.Rollback()
 
-		jobsMu.Lock()
-		defer jobsMu.Unlock()
-		jobs[id] = job
-		jobCond.Signal()
-
+		_, err = tx.Exec("INSERT INTO Jobs (id, payload, state) VALUES ($1, $2, $3)", id, req.Payload, StateQueued)
+		if err != nil {
+			log.Println("Failed to insert job: ", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return // This triggers defer tx.Rollback()
+		}
 		if idemKey != "" {
-			idemMu.Lock()
-			idem[idemKey] = id
-			idemMu.Unlock()
+			_, err = tx.Exec("UPDATE idempotency_keys SET status = 'COMPLETED', job_id = $1 WHERE idem_key = $2", id, idemKey)
+			if err != nil {
+				log.Println("Failed to update idem_key: ", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				return // This triggers defer tx.Rollback()
+			}
 		}
+
+		err = tx.Commit()
+		if err != nil {
+			log.Println("Failed to commit tx: ", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return // This triggers defer tx.Rollback()
+		}
+		jobCond.Signal()
 
 		logEvent("job_enqueued", map[string]interface{}{
 			"job_id":          id,
-			"payload_len":     len(job.Payload),
+			"payload_len":     len(req.Payload),
 			"idempotency_key": idemKey,
 		})
 
