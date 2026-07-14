@@ -214,7 +214,7 @@ func main() {
 			return // This triggers defer tx.Rollback()
 		}
 		if idemKey != "" {
-			_, err = tx.Exec("UPDATE idempotency_keys SET status = 'COMPLETED', job_id = $1 WHERE idem_key = $2", id, idemKey)
+			_, err = tx.Exec("UPDATE Idems SET status = 'COMPLETED', job_id = $1 WHERE idem_key = $2", id, idemKey)
 			if err != nil {
 				log.Println("Failed to update idem_key: ", err)
 				w.WriteHeader(http.StatusInternalServerError)
@@ -228,7 +228,10 @@ func main() {
 			w.WriteHeader(http.StatusInternalServerError)
 			return // This triggers defer tx.Rollback()
 		}
+
+		jobsMu.Lock()
 		jobCond.Signal()
+		jobsMu.Unlock()
 
 		logEvent("job_enqueued", map[string]interface{}{
 			"job_id":          id,
@@ -256,47 +259,61 @@ func main() {
 		timeout := 30 * time.Second
 		deadline := time.Now().Add(timeout)
 
-		jobsMu.Lock()
-		defer jobsMu.Unlock()
-
 		for {
 			now := time.Now().Unix()
 
-			for _, job := range jobs {
-				if job.State == StateQueued && (job.NextAvailableAt == 0 || job.NextAvailableAt <= now) {
-					job.State = StateLeased
-					job.LeaseOwner = req.WorkerID
-					job.LeaseExpiresAt = now + 30
-					job.LeaseID++
+			var job Job
 
-					logEvent("job_leased", map[string]interface{}{
-						"job_id":           job.ID,
-						"worker_id":        req.WorkerID,
-						"lease_id":         job.LeaseID,
-						"lease_expires_at": job.LeaseExpiresAt,
-					})
+			err := db.QueryRow(` 
+			UPDATE Jobs
+			SET state = 'LEASED',
+				lease_owner = $1,
+				lease_expires_at = $2,
+				lease_id = lease_id + 1
+			WHERE id = (
+				SELECT id from Jobs
+				WHERE state = 'QUEUED'
+					AND (next_available_at = 0 OR next_available_at <= $3)
+				FOR UPDATE SKIP LOCKED
+				LIMIT 1
+			)
+			RETURNING id, payload, attempts, max_tries, lease_id, state, lease_owner, lease_expires_at;
+			`, req.WorkerID, now+30, now).Scan(&job.ID, &job.Payload, &job.Attempts, &job.MaxTries, &job.LeaseID, &job.State, &job.LeaseOwner, &job.LeaseExpiresAt) //this basically just takes the first available job that isn't being looked at by another worker and set it to leased and gives it all its fields lol
 
-					w.Header().Set("Content-Type", "application/json")
-					json.NewEncoder(w).Encode(job)
+			switch err {
+			case nil:
+				logEvent("job_leased", map[string]interface{}{
+					"job_id":           job.ID,
+					"worker_id":        req.WorkerID,
+					"lease_id":         job.LeaseID,
+					"lease_expires_at": job.LeaseExpiresAt,
+				})
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(job)
+				return
+			case sql.ErrNoRows: //when no job available
+				remaining := time.Until(deadline)
+				if remaining <= 0 {
+					w.WriteHeader(http.StatusNoContent)
 					return
 				}
-			}
 
-			//when no job available
-			remaining := time.Until(deadline)
-			if remaining <= 0 {
-				w.WriteHeader(http.StatusNoContent)
+				timer := time.AfterFunc(remaining, func() {
+					jobsMu.Lock()
+					jobCond.Signal()
+					jobsMu.Unlock()
+				})
+
+				jobsMu.Lock()
+				jobCond.Wait()
+				jobsMu.Unlock()
+
+				timer.Stop()
+			default:
+				log.Println("Failed to poll for job: ", err)
+				w.WriteHeader(http.StatusInternalServerError)
 				return
 			}
-
-			timer := time.AfterFunc(remaining, func() {
-				jobsMu.Lock()
-				jobCond.Signal()
-				jobsMu.Unlock()
-			})
-
-			jobCond.Wait()
-			timer.Stop()
 
 		}
 	})

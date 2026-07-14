@@ -352,27 +352,27 @@ of distributed systems design.
 
 ### Concepts Learned
 
-* Strong typing in relational databases vs. flexible in-memory maps (e.g., handling the `"PENDING"` state dilemma in SQL).
-* Time representations in databases (avoiding Y2K38 by mapping Go's `int64` to Postgres `BIGINT`).
-* Docker fundamentals: Containerization ensures reproducible infrastructure across different environments ("it works on my machine" is no longer an excuse).
-* Docker Compose: Using YAML to define and orchestrate local infrastructure.
-* Go's `database/sql` package acts as a generic interface and requires a specific driver (like `[github.com/lib/pq](https://github.com/lib/pq)`) to communicate with Postgres.
-* `sql.Open` only validates the connection string format; a physical `Ping()` is required to verify actual database reachability.
+- Strong typing in relational databases vs. flexible in-memory maps (e.g., handling the `"PENDING"` state dilemma in SQL).
+- Time representations in databases (avoiding Y2K38 by mapping Go's `int64` to Postgres `BIGINT`).
+- Docker fundamentals: Containerization ensures reproducible infrastructure across different environments ("it works on my machine" is no longer an excuse).
+- Docker Compose: Using YAML to define and orchestrate local infrastructure.
+- Go's `database/sql` package acts as a generic interface and requires a specific driver (like `[github.com/lib/pq](https://github.com/lib/pq)`) to communicate with Postgres.
+- `sql.Open` only validates the connection string format; a physical `Ping()` is required to verify actual database reachability.
 
 ### What I Built
 
-* Translated the in-memory `Job` struct and `idem` map into strict PostgreSQL `CREATE TABLE` definitions.
-* Utilized Postgres `ENUM` types for job states and `UUID` for primary keys.
-* Set up a `./sql/schema.sql` file and mapped it to Docker's `/docker-entrypoint-initdb.d/` volume for automatic database initialization.
-* Wrote a `docker-compose.yml` file to provision a local PostgreSQL 15 server.
-* Implemented `initDB()` in `main.go` to establish and verify the connection between the Go broker and the Dockerized database.
+- Translated the in-memory `Job` struct and `idem` map into strict PostgreSQL `CREATE TABLE` definitions.
+- Utilized Postgres `ENUM` types for job states and `UUID` for primary keys.
+- Set up a `./sql/schema.sql` file and mapped it to Docker's `/docker-entrypoint-initdb.d/` volume for automatic database initialization.
+- Wrote a `docker-compose.yml` file to provision a local PostgreSQL 15 server.
+- Implemented `initDB()` in `main.go` to establish and verify the connection between the Go broker and the Dockerized database.
 
 ### The Struggle & Troubleshooting
 
-* Navigated strict YAML syntax rules (e.g., ensuring port mappings like `"5432:5432"` are quoted to prevent parser errors).
-* Encountered the classic "Ghost Database" port conflict. The Go application threw a `role "postgres" does not exist` error despite Docker running perfectly.
-* Investigated container logs using `docker compose logs` and learned to cleanly wipe volume state using `docker compose down -v`.
-* Discovered that a native MacOS background process was hogging port 5432 and intercepting the Go connection before it could reach the Docker container. Resolved by killing the local background service to clear the port.
+- Navigated strict YAML syntax rules (e.g., ensuring port mappings like `"5432:5432"` are quoted to prevent parser errors).
+- Encountered the classic "Ghost Database" port conflict. The Go application threw a `role "postgres" does not exist` error despite Docker running perfectly.
+- Investigated container logs using `docker compose logs` and learned to cleanly wipe volume state using `docker compose down -v`.
+- Discovered that a native MacOS background process was hogging port 5432 and intercepting the Go connection before it could reach the Docker container. Resolved by killing the local background service to clear the port.
 
 ### Key Takeaway
 
@@ -388,15 +388,32 @@ Look at where you put `jobCond.Signal()`:
 
 ### Concepts Learned
 
-* **Database Transactions (`db.Begin`):** Learned how to group multiple SQL operations (inserts and updates) into a single atomic block. If one fails, `defer tx.Rollback()` ensures the database is not left in a corrupted, partial state.
-* **SQL Injection Prevention:** Using parameterized queries (`$1`, `$2`) to safely insert variables instead of string concatenation.
-* **Atomic Locks via `ON CONFLICT`:** Replaced Go Mutexes with database-level constraints. Using `INSERT ... ON CONFLICT DO NOTHING` allows the database to instantly and safely reject duplicate idempotency keys from concurrent requests.
-* **Handling SQL NULLs in Go:** Standard variables panic when reading `NULL` from a database. Learned to use `sql.NullString` to safely scan empty columns (like a missing `job_id` during a `PENDING` state).
-* **Silent Failures:** The importance of aggressively checking `err != nil` after every `tx.Exec()`. Failing to check errors inside a transaction leads to partial executions silently succeeding.
-* **Transaction Visibility (Race Conditions):** A `jobCond.Signal()` must only be fired *after* `tx.Commit()`. Signaling earlier wakes up workers before the data is actually visible in the database, resulting in missed jobs.
+- **Database Transactions (`db.Begin`):** Learned how to group multiple SQL operations (inserts and updates) into a single atomic block. If one fails, `defer tx.Rollback()` ensures the database is not left in a corrupted, partial state.
+- **SQL Injection Prevention:** Using parameterized queries (`$1`, `$2`) to safely insert variables instead of string concatenation.
+- **Atomic Locks via `ON CONFLICT`:** Replaced Go Mutexes with database-level constraints. Using `INSERT ... ON CONFLICT DO NOTHING` allows the database to instantly and safely reject duplicate idempotency keys from concurrent requests.
+- **Handling SQL NULLs in Go:** Standard variables panic when reading `NULL` from a database. Learned to use `sql.NullString` to safely scan empty columns (like a missing `job_id` during a `PENDING` state).
+- **Silent Failures:** The importance of aggressively checking `err != nil` after every `tx.Exec()`. Failing to check errors inside a transaction leads to partial executions silently succeeding.
+- **Transaction Visibility (Race Conditions):** A `jobCond.Signal()` must only be fired *after* `tx.Commit()`. Signaling earlier wakes up workers before the data is actually visible in the database, resulting in missed jobs.
 
 ### What I Built
 
-* Completely rewrote the `/enqueue` endpoint to remove the global `jobsMu` and `idemMu` maps.
-* Implemented a transactional insert to save the `Job` and update the `idempotency_keys` table atomically.
-* Built a fallback read mechanism (`db.QueryRow`) to return `409 Conflict` for pending jobs or `200 OK` with the existing `job_id` for safely retried jobs.
+- Completely rewrote the `/enqueue` endpoint to remove the global `jobsMu` and `idemMu` maps.
+- Implemented a transactional insert to save the `Job` and update the `idempotency_keys` table atomically.
+- Built a fallback read mechanism (`db.QueryRow`) to return `409 Conflict` for pending jobs or `200 OK` with the existing `job_id` for safely retried jobs.
+
+## Day 10 — The Thundering Herd & Advanced Concurrency
+
+### Concepts Learned
+
+- **The "Thundering Herd" Problem:** Learned how concurrent workers querying a database simultaneously can all grab the same job if not properly managed.
+- **Row-Level Locking (`FOR UPDATE SKIP LOCKED`):** Used PostgreSQL's native locking mechanism to ensure that a `SELECT` query safely locks a row, allowing concurrent workers to gracefully skip over jobs that are currently being leased by others.
+- **Atomic Read-Modify-Write:** Leveraged the `RETURNING` clause in Postgres to execute an `UPDATE` and fetch the modified row's data in a single, atomic network call.
+- **The "Lost Wakeup" Problem:** Deep-dived into Go's `sync.Cond` mechanics. Discovered exactly why `Wait()` strictly requires holding a Mutex (to safely add the worker to the sleep queue without missing signals) and why wrapping `Signal()` in that same lock prevents microsecond race conditions between querying the database and falling asleep.
+- **Time Paradigms:** Differentiated between HTTP connection lifecycle management (Go's `time.Time` for deadlines/timeouts) and raw database timestamps (Unix Epoch integers for fast `BIGINT` comparisons).
+- **Error Handling with `switch`:** Refactored long `if / else if` error chains into clean `switch err` blocks to safely handle `sql.ErrNoRows` versus fatal database errors without redundant logic.
+
+### What I Built
+
+- Completely rewrote the `/poll` endpoint to remove the global `jobsMu` lock from the database query, allowing Postgres to handle concurrent reads natively.
+- Implemented a complex SQL transaction to safely find, lease, and return a queued job in one step.
+- Built a hybrid polling mechanism: workers check the database, and if empty, sleep using `jobCond.Wait()` while respecting a strict HTTP deadline via `time.AfterFunc` to prevent infinite hanging.
