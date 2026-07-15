@@ -331,14 +331,36 @@ func main() {
 			return
 		}
 
-		jobsMu.Lock()
-		defer jobsMu.Unlock()
-
-		job, ok := jobs[req.JobID]
-		if !ok {
-			w.WriteHeader(http.StatusNotFound)
+		tx, err := db.Begin() //setup a transaction
+		if err != nil {
+			log.Println("Error with db.Begin(): ", err)
+			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
+		defer tx.Rollback()
+
+		var job Job
+
+		err = tx.QueryRow(`
+		SELECT id, state, COALESCE(lease_owner, ''), lease_id, COALESCE(lease_expires_at, 0) 
+		FROM jobs 
+		WHERE id = $1 FOR UPDATE
+		`, req.JobID).Scan(&job.ID, &job.State, &job.LeaseOwner, &job.LeaseID, &job.LeaseExpiresAt)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			log.Println("Error with tx query: ", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		// job, ok := jobs[req.JobID]
+		// if !ok {
+		// 	w.WriteHeader(http.StatusNotFound)
+		// 	return
+		// }
 
 		if job.State == StateDone { //already been acked
 			w.WriteHeader(http.StatusOK)
@@ -379,9 +401,27 @@ func main() {
 		}
 
 		//mark done
-		job.State = StateDone
-		job.LeaseOwner = ""
-		job.LeaseExpiresAt = 0
+		_, err = tx.Exec(`
+		UPDATE Jobs
+		SET state=$1, lease_owner='', lease_expires_at=0
+		WHERE id=$2
+		`, StateDone, req.JobID)
+		if err != nil {
+			log.Println("Failed to update job fields: ", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return // This triggers defer tx.Rollback()
+		}
+
+		err = tx.Commit()
+		if err != nil {
+			log.Println("Failed to commit tx: ", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return // This triggers defer tx.Rollback()
+		}
+
+		// job.State = StateDone
+		// job.LeaseOwner = ""
+		// job.LeaseExpiresAt = 0
 
 		logEvent("job_acked", map[string]interface{}{
 			"job_id":    job.ID,
@@ -406,14 +446,36 @@ func main() {
 			return
 		}
 
-		jobsMu.Lock()
-		defer jobsMu.Unlock()
-
-		job, ok := jobs[req.JobID]
-		if !ok {
-			w.WriteHeader(http.StatusNotFound)
+		tx, err := db.Begin() //setup a transaction
+		if err != nil {
+			log.Println("Error with db.Begin(): ", err)
+			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
+		defer tx.Rollback()
+
+		var job Job
+
+		err = tx.QueryRow(`
+		SELECT id, state, COALESCE(lease_owner, ''), lease_id, COALESCE(lease_expires_at, 0), max_tries, attempts 
+		FROM jobs 
+		WHERE id = $1 FOR UPDATE
+		`, req.JobID).Scan(&job.ID, &job.State, &job.LeaseOwner, &job.LeaseID, &job.LeaseExpiresAt, &job.MaxTries, &job.Attempts)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			log.Println("Error with tx query: ", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		// job, ok := jobs[req.JobID]
+		// if !ok {
+		// 	w.WriteHeader(http.StatusNotFound)
+		// 	return
+		// }
 
 		if job.State == StateDone {
 			w.WriteHeader(http.StatusOK)
@@ -461,22 +523,38 @@ func main() {
 			})
 
 			w.WriteHeader(http.StatusOK)
-			return
+		} else {
+
+			// Retry later with backoff + full jitter
+			delay := retryDelaySeconds(job.Attempts)
+
+			job.State = StateQueued
+			job.LeaseOwner = ""
+			job.LeaseExpiresAt = 0
+			job.NextAvailableAt = now + delay
+
+			logEvent("job_retry_scheduled", map[string]interface{}{
+				"job_id":            job.ID,
+				"attempts":          job.Attempts,
+				"next_available_at": job.NextAvailableAt,
+			})
+		}
+		_, err = tx.Exec(`
+	Update Jobs SET state=$1, lease_owner=$2,
+	lease_expires_at=$3, next_available_at=$4, attempts=$5
+	WHERE id=$6`, job.State, job.LeaseOwner, job.LeaseExpiresAt, job.NextAvailableAt, job.Attempts, req.JobID)
+		if err != nil {
+			log.Println("Failed to update job fields: ", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return // This triggers defer tx.Rollback()
 		}
 
-		// Retry later with backoff + full jitter
-		delay := retryDelaySeconds(job.Attempts)
-
-		job.State = StateQueued
-		job.LeaseOwner = ""
-		job.LeaseExpiresAt = 0
-		job.NextAvailableAt = now + delay
-
-		logEvent("job_retry_scheduled", map[string]interface{}{
-			"job_id":            job.ID,
-			"attempts":          job.Attempts,
-			"next_available_at": job.NextAvailableAt,
-		})
+		err = tx.Commit()
+		if err != nil {
+			log.Println("Failed to commit tx: ", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return // This triggers defer tx.Rollback()
+		}
 
 		w.WriteHeader(http.StatusOK)
 

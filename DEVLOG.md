@@ -378,12 +378,6 @@ of distributed systems design.
 
 Infrastructure as code is just as unforgiving as application logic. Moving from in-memory state to a durable database introduces entirely new failure domains—from strict type enforcement to networking and port binding conflicts. A bulletproof application still fails if the infrastructure beneath it is misconfigured.
 
-This looks phenomenal. You have officially written a production-grade, transaction-safe, idempotency-locked database handler. You handled the `NULL` trap, fixed the silent failures, and successfully removed the in-memory maps!
-
-There is just **one tiny, classic concurrency trap** left in your code before we wrap up for the day.
-
-Look at where you put `jobCond.Signal()`:
-
 ## Day 9 — ACID Transactions & Idempotency in SQL
 
 ### Concepts Learned
@@ -417,3 +411,17 @@ Look at where you put `jobCond.Signal()`:
 - Completely rewrote the `/poll` endpoint to remove the global `jobsMu` lock from the database query, allowing Postgres to handle concurrent reads natively.
 - Implemented a complex SQL transaction to safely find, lease, and return a queued job in one step.
 - Built a hybrid polling mechanism: workers check the database, and if empty, sleep using `jobCond.Wait()` while respecting a strict HTTP deadline via `time.AfterFunc` to prevent infinite hanging.
+
+## Day 10 — Row-Level Locking & Transactional State Machines
+
+### Concepts Learned
+
+* **Row-Level Locking (`FOR UPDATE`):** Discovered the massive race condition in "Read-Check-Update" flows. Solved it using Postgres's `SELECT ... FOR UPDATE` within a transaction, which physically locks the specific row from other workers until the Go logic finishes validating leases and commits the update.
+* **Handling Database NULLs (`COALESCE`):** Learned that Go's standard variables (like strings and integers) will panic if they scan a `NULL` from the database. Utilized the SQL `COALESCE()` function to safely default `NULL` lease owners to empty strings.
+* **Error Handling (`sql.ErrNoRows`):** Implemented strict checks for `sql.ErrNoRows` during `QueryRow` executions to properly return `404 Not Found` HTTP status codes for invalid worker requests.
+* **DRY Query Execution:** Optimized Go code by calculating state variables (like next available time and job state) within Go's control flow, allowing the transaction to execute a single, unified `UPDATE` query instead of repeating SQL strings.
+
+### What I Built
+
+* Successfully migrated the `/ack` endpoint to a transactional SQL model, ensuring that jobs are only marked as `DONE` if the worker still holds a valid, unexpired lease.
+* Successfully migrated the `/fail` endpoint, rebuilding the Dead Letter Queue (DLQ) routing and exponential backoff retry scheduling entirely within safe database transactions.
