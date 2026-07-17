@@ -425,3 +425,18 @@ Infrastructure as code is just as unforgiving as application logic. Moving from 
 
 * Successfully migrated the `/ack` endpoint to a transactional SQL model, ensuring that jobs are only marked as `DONE` if the worker still holds a valid, unexpired lease.
 * Successfully migrated the `/fail` endpoint, rebuilding the Dead Letter Queue (DLQ) routing and exponential backoff retry scheduling entirely within safe database transactions.
+
+## Day 11 — Stateless Endpoints & Background Sweepers
+
+### Concepts Learned
+
+* **Querying Multiple Rows (`db.Query`):** Transitioned from `QueryRow` (single result) to iterating over `rows.Next()` to return multiple records. Learned the critical importance of `defer rows.Close()` to prevent database connection leaks.
+* **Bulk SQL Updates (`RETURNING`):** Replaced an inefficient Go `for` loop that updated records one by one with a single, atomic SQL `UPDATE` statement. Used the `RETURNING id` clause to get immediate feedback from Postgres on which rows were modified.
+* **State Synchronization:** Reinforced that `jobCond.Signal()` must always happen *after* `tx.Commit()`. Furthermore, when expiring multiple jobs simultaneously, looping through the expired IDs to call `jobCond.Signal()` ensures the exact correct number of sleeping workers are woken up.
+* **Complete Statelessness:** Achieved a fully stateless application layer. The Go server no longer holds any state in RAM, meaning it can be horizontally scaled, killed, or restarted without losing a single job.
+
+### What I Built
+
+* Rewrote the `/jobs` and `/dead` administrative endpoints using `db.Query` to pull directly from the database, effectively replacing the old global mutex maps.
+* Safely deleted all global in-memory maps (`jobs`, `idem`) and their corresponding Mutexes.
+* Refactored the `expireLeases` background goroutine to execute a bulk, lock-safe database sweep (`FOR UPDATE SKIP LOCKED`) that instantly re-queues jobs from crashed or timed-out workers.

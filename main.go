@@ -16,11 +16,7 @@ import (
 )
 
 var (
-	jobs   = make(map[string]*Job)
 	jobsMu sync.Mutex
-
-	idem   = make(map[string]string) //idem_key -> job_id
-	idemMu sync.Mutex
 
 	jobCond = sync.NewCond(&jobsMu)
 
@@ -85,27 +81,62 @@ func initDB() {
 	log.Println("Successfully connected to the database!")
 }
 
-func expireLeases(now int64) []string {
-	var expiredIDs []string = make([]string, 0)
+func expireLeases(now int64) []uuid.UUID {
+	var expiredIDs []uuid.UUID = make([]uuid.UUID, 0)
 
-	jobsMu.Lock()
-	defer jobsMu.Unlock()
+	tx, err := db.Begin()
+	if err != nil {
+		log.Println("Error with db.Begin(): ", err)
+		return expiredIDs
+	}
+	defer tx.Rollback()
 
-	for id, job := range jobs {
-		if job.State == StateLeased && job.LeaseExpiresAt > 0 && job.LeaseExpiresAt <= now {
-			job.State = StateQueued
-			job.LeaseOwner = ""
-			job.LeaseExpiresAt = 0
-			job.NextAvailableAt = 0
-			expiredIDs = append(expiredIDs, id)
-			jobCond.Signal()
+	rows, err := tx.Query(`
+	UPDATE Jobs
+	SET state=$1, lease_owner=NULL, lease_expires_at=0, next_available_at=0
+	WHERE id IN (
+				SELECT id from Jobs
+				WHERE state = 'LEASED'
+					AND lease_expires_at <= $2
+				FOR UPDATE SKIP LOCKED
+			)
+			RETURNING id`, StateQueued, now)
+	if err != nil {
+		log.Println("Error with tx.Query(): ", err)
+		return expiredIDs
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id uuid.UUID
+
+		err = rows.Scan(&id)
+		if err != nil {
+			log.Println("Error with rows.Scan(): ", err)
+			return expiredIDs
 		}
+
+		expiredIDs = append(expiredIDs, id)
+	}
+
+	if err = rows.Err(); err != nil {
+		log.Println("Error with iteration: ", err)
+		return expiredIDs
+	}
+
+	if err = tx.Commit(); err != nil {
+		log.Println("Error committing lease expiration tx:", err)
+		return expiredIDs
 	}
 
 	for _, id := range expiredIDs {
 		logEvent("lease_expired", map[string]interface{}{
 			"job_id": id,
 		})
+
+		jobsMu.Lock()
+		jobCond.Signal()
+		jobsMu.Unlock()
 	}
 
 	return expiredIDs
@@ -153,7 +184,7 @@ func main() {
 		if idemKey != "" {
 			// 1. Try to lock the key by inserting PENDING
 			result, err := db.Exec(`
-				INSERT INTO idempotency_keys (idem_key, status) 
+				INSERT INTO Idems (idem_key, status) 
 				VALUES ($1, 'PENDING') 
 				ON CONFLICT (idem_key) DO NOTHING;
 			`, idemKey)
@@ -170,7 +201,7 @@ func main() {
 				var status string
 				var existingJobID sql.NullString // Safely handles NULLs!
 
-				err := db.QueryRow("SELECT status, job_id FROM idempotency_keys WHERE idem_key = $1", idemKey).Scan(&status, &existingJobID)
+				err := db.QueryRow("SELECT status, job_id FROM Idems WHERE idem_key = $1", idemKey).Scan(&status, &existingJobID)
 				if err != nil {
 					log.Println("Query idempotency error:", err)
 					w.WriteHeader(http.StatusInternalServerError)
@@ -540,9 +571,9 @@ func main() {
 			})
 		}
 		_, err = tx.Exec(`
-	Update Jobs SET state=$1, lease_owner=$2,
-	lease_expires_at=$3, next_available_at=$4, attempts=$5
-	WHERE id=$6`, job.State, job.LeaseOwner, job.LeaseExpiresAt, job.NextAvailableAt, job.Attempts, req.JobID)
+		Update Jobs SET state=$1, lease_owner=$2,
+		lease_expires_at=$3, next_available_at=$4, attempts=$5
+		WHERE id=$6`, job.State, job.LeaseOwner, job.LeaseExpiresAt, job.NextAvailableAt, job.Attempts, req.JobID)
 		if err != nil {
 			log.Println("Failed to update job fields: ", err)
 			w.WriteHeader(http.StatusInternalServerError)
@@ -566,8 +597,38 @@ func main() {
 			return
 		}
 
-		jobsMu.Lock()
-		defer jobsMu.Unlock()
+		rows, err := db.Query(`
+		SELECT id, payload, state, attempts, max_tries, lease_id, 
+				COALESCE(lease_owner, ''), COALESCE(lease_expires_at, 0), COALESCE(next_available_at, 0)
+			FROM Jobs`)
+		if err != nil {
+			log.Println("Failed to query: ", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+
+		jobs := make(map[string]*Job)
+
+		for rows.Next() {
+			var job Job
+
+			err = rows.Scan(&job.ID, &job.Payload, &job.State, &job.Attempts, &job.MaxTries, &job.LeaseID, &job.LeaseOwner, &job.LeaseExpiresAt, &job.NextAvailableAt)
+			if err != nil {
+				log.Println("Failed to Scan: ", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+
+			jobs[job.ID] = &job
+
+		}
+
+		if err = rows.Err(); err != nil {
+			log.Println("Error in row iteration: ", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(jobs)
@@ -579,14 +640,39 @@ func main() {
 			return
 		}
 
-		jobsMu.Lock()
-		defer jobsMu.Unlock()
+		rows, err := db.Query(`
+			SELECT id, payload, state, attempts, max_tries, lease_id, 
+				COALESCE(lease_owner, ''), COALESCE(lease_expires_at, 0), COALESCE(next_available_at, 0)
+			FROM Jobs
+			WHERE state = $1
+		`, StateDead)
+		if err != nil {
+			log.Println("Failed to query: ", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
 
 		dead := make(map[string]*Job)
-		for id, job := range jobs {
-			if job.State == StateDead {
-				dead[id] = job
+
+		for rows.Next() {
+			var job Job
+
+			err = rows.Scan(&job.ID, &job.Payload, &job.State, &job.Attempts, &job.MaxTries, &job.LeaseID, &job.LeaseOwner, &job.LeaseExpiresAt, &job.NextAvailableAt)
+			if err != nil {
+				log.Println("Failed to Scan: ", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
 			}
+
+			dead[job.ID] = &job
+
+		}
+
+		if err = rows.Err(); err != nil {
+			log.Println("Error in row iteration: ", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 
 		w.Header().Set("Content-Type", "application/json")
