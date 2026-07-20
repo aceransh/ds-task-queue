@@ -1,0 +1,7 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: "ds-task-queue-broker"
+    static_configs:
+      - targets: ["broker:8080"]

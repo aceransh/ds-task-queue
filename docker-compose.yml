@@ -8,3 +8,30 @@ services:
       - "5432:5432"
     volumes:
       - ./sql/schema.sql:/docker-entrypoint-initdb.d/init.sql
+    
+  broker:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - DATABASE_URL=host=my-database port=5432 user=postgres password=db_password dbname=myDB sslmode=disable
+    depends_on:
+      - my-database
+  
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    depends_on:
+      - broker
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    depends_on:
+      - prometheus

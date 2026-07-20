@@ -1,18 +1,25 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand"
 	"net/http"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	"database/sql"
 
 	"github.com/google/uuid"
 	_ "github.com/lib/pq"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 var (
@@ -21,6 +28,21 @@ var (
 	jobCond = sync.NewCond(&jobsMu)
 
 	db *sql.DB
+
+	jobsEnqueuedMetric = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "task_queue_jobs_enqueued_total",
+		Help: "Total number of jobs succesfully enqueued",
+	})
+
+	jobsAckedMetric = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "task_queue_jobs_acked_total",
+		Help: "Total number of jobs succesfully acknowledged",
+	})
+
+	jobsFailedMetric = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "task_queue_jobs_failed_total",
+		Help: "Total number of job fails recorded",
+	})
 )
 
 type PollRequest struct {
@@ -68,17 +90,33 @@ type Job struct {
 
 func initDB() {
 	var err error
-	db, err = sql.Open("postgres", "host=localhost port=5432 user=postgres password=db_password dbname=myDB sslmode=disable")
-	if err != nil {
-		log.Fatal("failed to open db: ", err)
+
+	connStr := os.Getenv("DATABASE_URL")
+	if connStr == "" {
+		connStr = "host=localhost port=5432 user=postgres password=db_password dbname=myDB sslmode=disable"
 	}
 
-	err = db.Ping()
-	if err != nil {
-		log.Fatal("Failed to ping db: ", err)
-	}
+	for i := 0; i <= 5; i++ {
+		db, err = sql.Open("postgres", connStr)
+		if err != nil {
+			log.Print("failed to open db: ", err)
+			time.Sleep(time.Second * 2)
+			continue
+		}
 
-	log.Println("Successfully connected to the database!")
+		if err = db.Ping(); err != nil {
+			log.Print("Failed to ping db: ", err)
+			time.Sleep(time.Second * 2)
+			continue
+		}
+
+		if i == 5 {
+			log.Fatal("completely failed to connect to db after 5 tries")
+		}
+
+		log.Println("Successfully connected to the database!")
+		break
+	}
 }
 
 func expireLeases(now int64) []uuid.UUID {
@@ -167,12 +205,20 @@ func logEvent(event string, fields map[string]any) {
 	log.Println(msg)
 }
 
+func init() {
+	prometheus.MustRegister(jobsEnqueuedMetric)
+	prometheus.MustRegister(jobsAckedMetric)
+	prometheus.MustRegister(jobsFailedMetric)
+}
+
 func main() {
 	initDB()
 
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, "ok")
 	})
+
+	http.Handle("/metrics", promhttp.Handler())
 
 	http.HandleFunc("/enqueue", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -263,6 +309,8 @@ func main() {
 		jobsMu.Lock()
 		jobCond.Signal()
 		jobsMu.Unlock()
+
+		jobsEnqueuedMetric.Inc()
 
 		logEvent("job_enqueued", map[string]interface{}{
 			"job_id":          id,
@@ -387,12 +435,6 @@ func main() {
 			return
 		}
 
-		// job, ok := jobs[req.JobID]
-		// if !ok {
-		// 	w.WriteHeader(http.StatusNotFound)
-		// 	return
-		// }
-
 		if job.State == StateDone { //already been acked
 			w.WriteHeader(http.StatusOK)
 			return
@@ -450,9 +492,7 @@ func main() {
 			return // This triggers defer tx.Rollback()
 		}
 
-		// job.State = StateDone
-		// job.LeaseOwner = ""
-		// job.LeaseExpiresAt = 0
+		jobsAckedMetric.Inc()
 
 		logEvent("job_acked", map[string]interface{}{
 			"job_id":    job.ID,
@@ -501,12 +541,6 @@ func main() {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-
-		// job, ok := jobs[req.JobID]
-		// if !ok {
-		// 	w.WriteHeader(http.StatusNotFound)
-		// 	return
-		// }
 
 		if job.State == StateDone {
 			w.WriteHeader(http.StatusOK)
@@ -586,6 +620,8 @@ func main() {
 			w.WriteHeader(http.StatusInternalServerError)
 			return // This triggers defer tx.Rollback()
 		}
+
+		jobsFailedMetric.Inc()
 
 		w.WriteHeader(http.StatusOK)
 
@@ -688,6 +724,40 @@ func main() {
 		}
 	}()
 
-	log.Println("Listening on port 8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	server := &http.Server{
+		Addr:    ":8080",
+		Handler: nil,
+	}
+
+	go func() {
+		log.Println("Listening on port 8080")
+
+		err := server.ListenAndServe()
+		if err != nil && err != http.ErrServerClosed {
+			log.Fatal("Server Crashed: ", err)
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+
+	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
+
+	<-quit
+
+	log.Println("Interrupt signal received. Initiating graceful shutdown...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	defer cancel()
+
+	if err := server.Shutdown(ctx); err != nil {
+		log.Fatalf("Server forced to shutdown: %v", err)
+	}
+
+	log.Println("Closing database connections...")
+	if err := db.Close(); err != nil {
+		log.Fatalf("Database connection close failed: %v", err)
+	}
+
+	log.Println("Graceful shutdown complete.")
+
 }

@@ -440,3 +440,19 @@ Infrastructure as code is just as unforgiving as application logic. Moving from 
 * Rewrote the `/jobs` and `/dead` administrative endpoints using `db.Query` to pull directly from the database, effectively replacing the old global mutex maps.
 * Safely deleted all global in-memory maps (`jobs`, `idem`) and their corresponding Mutexes.
 * Refactored the `expireLeases` background goroutine to execute a bulk, lock-safe database sweep (`FOR UPDATE SKIP LOCKED`) that instantly re-queues jobs from crashed or timed-out workers.
+
+## Day 12 — Containerization, Graceful Shutdowns & Observability
+
+### Concepts Learned
+
+* **Container Orchestration (`docker-compose`):** Learned how to network multiple services (Go backend, PostgreSQL, Prometheus, Grafana) together using Docker Compose. Discovered that the Go application often boots faster than the database, requiring an explicit connection retry loop on startup to prevent crash loops.
+* **Asynchronous Servers & OS Signals:** Realized that `http.ListenAndServe` blocks the main execution thread. Moved the HTTP server into a background goroutine and used Go's `os/signal` package and channels to trap `SIGINT` and `SIGTERM` signals. This prevents the operating system from forcefully killing the app and dropping active database transactions.
+* **Graceful Shutdown (`context`):** Utilized `context.WithTimeout` paired with the server's built-in `.Shutdown()` method. This safely rejects new incoming HTTP requests while giving active handlers a strict deadline (e.g., 5 seconds) to finish their in-flight database operations before exiting.
+* **The Pull Model (Prometheus):** Shifted from a push-based telemetry mindset to a pull-based one. Learned how Prometheus periodically scrapes a `/metrics` endpoint, allowing the Go application to efficiently maintain lightweight in-memory counters (`prometheus.NewCounter`) without incurring the network overhead of pushing data.
+
+### What I Built
+
+* Wrote a `Dockerfile` for the Go application and a `docker-compose.yml` file to spin up the entire production-like infrastructure (Broker, Postgres, Prometheus, Grafana) with a single command.
+* Re-architected `main.go` to support graceful shutdowns, ensuring active requests finish and the PostgreSQL connection pool (`db.Close()`) is cleanly severed before the process exits.
+* Instrumented the application with the Prometheus Go client, creating counters to track total enqueued, acknowledged, and failed jobs.
+* Exposed the telemetry via `promhttp.Handler()` and strategically placed the `.Inc()` metric calls strictly *after* successful database `tx.Commit()` calls to guarantee 100% accurate dashboard telemetry.

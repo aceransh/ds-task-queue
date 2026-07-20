@@ -2,129 +2,68 @@
 
 ## Overview
 
-This project is a **Distributed Task Queue** implemented in **Go**, built to deeply understand core **distributed systems fundamentals** through hands-on implementation and failure testing.
+This project is a **Distributed Task Queue** implemented in **Go**, built to deeply understand core **distributed systems fundamentals** through hands-on implementation and failure testing[cite: 3]. 
 
 The system models a real-world task queue (SQS / Celery–style) where:
+- producers enqueue jobs,[cite: 3]
+- workers poll and process them,[cite: 3]
+- and the system remains correct under crashes, retries, and partial failures[cite: 3].
 
-- producers enqueue jobs,
-- workers poll and process them,
-- and the system remains correct under crashes, retries, and partial failures.
-
-The focus is on **correctness under failure**, not performance or production readiness.
-
-For a day-by-day build log and design reasoning, see **DEVLOG.md**.
+The focus is on **correctness under failure**, not performance or production readiness[cite: 3]. 
 
 ---
 
 ## System Guarantees & Semantics
 
 ### Delivery
-
-- **At-least-once delivery**  
-  Jobs may be delivered more than once. This is intentional and required for fault tolerance.
+- **At-least-once delivery:** Jobs may be delivered more than once[cite: 3]. This is intentional and required for fault tolerance[cite: 3].
 
 ### Exactly-once Effects (Enqueue)
+- **Idempotent enqueue via `Idempotency-Key`**[cite: 3]
+  - Repeated `/enqueue` requests with the same idempotency key return the same `job_id`[cite: 3].
+  - Duplicate jobs are not created for the same logical request[cite: 3].
+  - Concurrent duplicate requests return `409 Conflict` while the original request is in progress[cite: 3].
 
-- **Idempotent enqueue via `Idempotency-Key`**
-  - Repeated `/enqueue` requests with the same idempotency key return the same `job_id`.
-  - Duplicate jobs are not created for the same logical request.
-  - Concurrent duplicate requests return `409 Conflict` while the original request is in progress.
-
-> The system does **not** guarantee exactly-once execution. Instead, it guarantees **exactly-once effects** for job creation.
+> The system does **not** guarantee exactly-once execution[cite: 3]. Instead, it guarantees **exactly-once effects** for job creation[cite: 3].
 
 ### Leasing & Liveness
+- Jobs are leased to workers for a fixed duration (30 seconds)[cite: 3].
+- If a worker crashes or stalls, the lease expires and the job becomes visible again[cite: 3].
+- Liveness is prioritized over uniqueness[cite: 3].
 
-- Jobs are leased to workers for a fixed duration (30 seconds).
-- If a worker crashes or stalls, the lease expires and the job becomes visible again.
-- Liveness is prioritized over uniqueness.
-
-### Retries
-
-- Failed jobs retry with **exponential backoff and full jitter** to prevent retry storms and thundering herd effects.
-- Jobs exceeding `MaxTries` are moved to a **Dead Letter Queue (DLQ)**.
-
-### Dead Letter Queue (DLQ)
-
-- Poison messages are isolated instead of retried indefinitely.
-- Dead jobs can be inspected via `/dead` for debugging or manual intervention.
-
-### Limitations (Explicit)
-
-- In-memory storage only — broker restarts lose state.
-- Single-node broker (distribution and replication are future work).
-- Workers must be idempotent to safely handle duplicate execution.
+### Retries & Dead Letter Queue (DLQ)
+- Failed jobs retry with **exponential backoff and full jitter** to prevent retry storms and thundering herd effects[cite: 3].
+- Jobs exceeding `MaxTries` are moved to a **Dead Letter Queue (DLQ)**[cite: 3].
+- Poison messages are isolated instead of retried indefinitely[cite: 3].
+- Dead jobs can be inspected via `/dead` for debugging or manual intervention[cite: 3].
 
 ---
 
 ## Architecture Overview
 
-### Job States
-
-QUEUED → LEASED → DONE
-↘
-DEAD
-
 ### Core Components
-
-- **Broker**: owns job state, leasing, retries, and failure handling
-- **Workers**: poll for jobs, process them, and acknowledge success or failure
-- **Lease Sweeper**: periodically re-queues expired leases
+- **Broker (Go):** owns job state, leasing, retries, and failure handling[cite: 3].
+- **Database (PostgreSQL):** highly concurrent state management utilizing `FOR UPDATE SKIP LOCKED` to prevent worker contention.
+- **Workers:** poll for jobs, process them, and acknowledge success or failure[cite: 3].
+- **Lease Sweeper:** background goroutine that periodically re-queues expired leases[cite: 3].
+- **Observability Stack:** Prometheus and Grafana for real-time metric scraping (Pull Model).
 
 ---
 
 ## Implemented Features
 
-### Job Enqueuing (`/enqueue`)
+### 1. Advanced Job Routing & Polling
+- **Long Polling (`/poll`):** Workers may long-poll for jobs for up to **30 seconds**[cite: 3]. If a job is immediately available, it is returned right away[cite: 3]. If no jobs are available, the request blocks and returns `204 No Content` after the timeout[cite: 3]. If a job becomes available while polling, the request returns immediately with a leased job[cite: 3]. This reduces unnecessary polling traffic and mirrors production queue behavior (e.g., AWS SQS long polling)[cite: 3].
+- **Job Acknowledgement (`/ack`):** Workers explicitly acknowledge successful completion[cite: 3]. Stale or invalid acknowledgements are rejected[cite: 3].
+- **Job Failure Handling (`/fail`):** Workers report failed processing attempts[cite: 3]. Retries scheduled using exponential backoff + jitter[cite: 3].
 
-- Creates new jobs in the `QUEUED` state
-- Supports idempotent creation via `Idempotency-Key`
-- Returns a stable `job_id` for retries
+### 2. Production-Grade Resiliency
+- **Graceful Shutdown:** The broker intercepts OS signals (`SIGINT`, `SIGTERM`) to halt incoming requests, flush active database transactions, and close connection pools before exiting.
+- **Database Concurrency:** Job leasing is protected by transactional row-level locking (`FOR UPDATE SKIP LOCKED`), ensuring horizontal scalability without duplicate processing overhead.
 
-### Job Acknowledgement (`/ack`)
-
-- Workers explicitly acknowledge successful completion
-- Stale or invalid acknowledgements are rejected
-
-### Job Failure Handling (`/fail`)
-
-- Workers report failed processing attempts
-- Retries scheduled using exponential backoff + jitter
-- Jobs transition to `DEAD` after exceeding retry limit
-
-### Dead Letter Queue (`/dead`)
-
-- Lists jobs that permanently failed
-- Provides observability into poison messages
-
-### Lease Expiration
-
-- Background goroutine reclaims expired leases
-- Prevents job loss due to crashed or slow workers
-
-### Health Check (`/health`)
-
-- Simple liveness endpoint for monitoring
-
-### Long Polling (`/poll`)
-
-- Workers may long-poll for jobs for up to **30 seconds**
-- If a job is immediately available, it is returned right away
-- If no jobs are available:
-  - the request blocks
-  - and returns `204 No Content` after the timeout
-- If a job becomes available while polling:
-  - the request returns immediately with a leased job
-
-This reduces unnecessary polling traffic and mirrors production queue behavior
-(e.g., AWS SQS long polling).
-
----
-
-## Concurrency Model
-
-- Shared state protected by `sync.Mutex`
-- Explicit state transitions enforce correctness
-- Concurrency issues are treated as first-class failure modes
+### 3. Observability
+- Exposes a `/metrics` endpoint for Prometheus.
+- Tracks `task_queue_jobs_enqueued_total`, `task_queue_jobs_acked_total`, and `task_queue_jobs_failed_total`.
 
 ---
 
@@ -132,83 +71,65 @@ This reduces unnecessary polling traffic and mirrors production queue behavior
 
 | Endpoint | Method | Description |
 |--------|--------|-------------|
-| `/enqueue` | POST | Enqueue a job (idempotent) |
-| `/poll` | POST | Poll for a job (supports long polling) |
-| `/ack` | POST | Acknowledge successful job |
-| `/fail` | POST | Report job failure |
-| `/dead` | GET | Inspect dead-lettered jobs |
-| `/jobs` | GET | Inspect all jobs (debug) |
-| `/health` | GET | Health check |
+| `/enqueue` | POST | Enqueue a job (idempotent)[cite: 3]|
+| `/poll` | POST | Poll for a job (supports long polling)[cite: 3]|
+| `/ack` | POST | Acknowledge successful job[cite: 3]|
+| `/fail` | POST | Report job failure[cite: 3]|
+| `/dead` | GET | Inspect dead-lettered jobs[cite: 3]|
+| `/jobs` | GET | Inspect all jobs (debug)[cite: 3]|
+| `/health` | GET | Health check[cite: 3]|
+| `/metrics` | GET | Prometheus scrape endpoint |
 
 ---
 
 ## Failure Harness
 
-The system includes a lightweight failure harness used to validate correctness
-under real failure conditions.
+The system includes a lightweight failure harness used to validate correctness under real failure conditions[cite: 3]. The harness simulates:
+- high-rate job enqueuing[cite: 3]
+- multiple concurrent workers[cite: 3]
+- worker crashes and stalls[cite: 3]
+- broker restarts[cite: 3]
 
-The harness simulates:
+### Failure Scenarios Tested
+- Worker crashes mid-processing[cite: 3]
+- Worker stalls beyond lease duration[cite: 3]
+- Database connection loss and automatic retry
+- Duplicate enqueue requests (idempotency)[cite: 3]
+- Retry storms and poison messages[cite: 3]
+- Stale acknowledgements[cite: 3]
+- Concurrent workers contending for jobs[cite: 3]
 
-- high-rate job enqueuing
-- multiple concurrent workers
-- worker crashes and stalls
-- broker restarts
-
-### Test Workflow
-
-1. Enqueue a large volume of jobs
-2. Run multiple workers that randomly:
-   - acknowledge jobs
-   - fail jobs
-   - hang mid-processing (simulate crashes)
-3. Restart the broker mid-flight
-4. Observe:
-   - lease expiration
-   - job re-delivery
-   - retry behavior
-   - dead-letter transitions
-
-All correctness guarantees are validated through **observable state transitions**
-rather than mocks or unit tests.
-
-## Failure Scenarios Tested
-
-- Worker crashes mid-processing
-- Worker stalls beyond lease duration
-- Broker restart (in-memory state loss)
-- Duplicate enqueue requests (idempotency)
-- Retry storms and poison messages
-- Stale acknowledgements
-- Concurrent workers contending for jobs
-- Jobs re-delivered after lease expiration
+All correctness guarantees are validated through **observable state transitions** rather than mocks or unit tests[cite: 3].
 
 ---
 
 ## Why This Project
 
 This project was built to:
+- Understand **why** distributed systems are designed the way they are[cite: 3].
+- Learn Go through real concurrency problems[cite: 3].
+- Demonstrate understanding of **network-efficient queue design** via long polling[cite: 3].
+- Serve as a foundational portfolio piece targeting backend engineering and AI SRE roles in the San Diego tech market.
 
-- Understand **why** distributed systems are designed the way they are
-- Learn Go through real concurrency problems
-- Build something that can be confidently discussed in interviews
-- Demonstrate understanding of **network-efficient queue design** via long polling
-
-It intentionally trades completeness for clarity and correctness.
+It intentionally trades completeness for clarity and correctness[cite: 3].
 
 ---
 
 ## How to Run
 
 ```bash
-go run .
+docker-compose up --build
 
-Use curl or Postman to interact with the API.
 ```
 
-⸻
+* **Broker API:** `http://localhost:8080`
+* **Prometheus UI:** `http://localhost:9090`
+* **Grafana Dashboards:** `http://localhost:3000`
+
+Use `curl` or Postman to interact with the API, or run the included `enqueue_spam.sh` and `worker.sh` bash scripts to simulate load.
+
+---
 
 ## License
 
 Educational use only. Not intended for production deployment.
-
----
