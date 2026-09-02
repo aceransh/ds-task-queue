@@ -14,6 +14,8 @@ CREATE TABLE Jobs (
     next_available_at BIGINT NOT NULL DEFAULT 0
 );
 
+CREATE INDEX IF NOT EXISTS idx_jobs_state_next_available ON Jobs (state, next_available_at);
+
 CREATE TABLE Idems (
     idem_key TEXT PRIMARY KEY,
     job_id UUID,

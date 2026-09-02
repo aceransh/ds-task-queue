@@ -7,17 +7,36 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - ./sql/schema.sql:/docker-entrypoint-initdb.d/init.sql
-    
+      - ./sql/schema.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d myDB"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   broker:
-    build: .
+    build:
+      context: .
+      args:
+        APP_NAME: broker
     ports:
       - "8080:8080"
     environment:
-      - DATABASE_URL=host=my-database port=5432 user=postgres password=db_password dbname=myDB sslmode=disable
+      - DB_DSN=host=my-database port=5432 user=postgres password=db_password dbname=myDB sslmode=disable
     depends_on:
-      - my-database
-  
+      my-database:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      args:
+        APP_NAME: worker
+    environment:
+      - BROKER_URL=http://broker:8080
+    depends_on:
+      - broker
+
   prometheus:
     image: prom/prometheus:latest
     ports:

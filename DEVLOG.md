@@ -456,3 +456,25 @@ Infrastructure as code is just as unforgiving as application logic. Moving from 
 * Re-architected `main.go` to support graceful shutdowns, ensuring active requests finish and the PostgreSQL connection pool (`db.Close()`) is cleanly severed before the process exits.
 * Instrumented the application with the Prometheus Go client, creating counters to track total enqueued, acknowledged, and failed jobs.
 * Exposed the telemetry via `promhttp.Handler()` and strategically placed the `.Inc()` metric calls strictly *after* successful database `tx.Commit()` calls to guarantee 100% accurate dashboard telemetry.
+
+## Day 13 — Package Structure, a Real Worker Binary, and Integration Tests
+
+### Concepts Learned
+
+- A single `main.go` mixing HTTP handlers, DB access, and shared types is fine for a prototype, but it blocks testing: package-level globals (`db`, `jobsMu`, `jobCond`) mean every test shares the same mutable state.
+- Dependency injection via a struct (rather than package globals) lets each test spin up its own isolated instance pointed at its own connection.
+- Integration tests for a system built on `FOR UPDATE SKIP LOCKED` and row-level locking are only meaningful against a real database — mocking `database/sql` would test the mock, not the locking behavior the system actually depends on.
+- A worker that's "just curl in a bash loop" is fine for failure injection, but a real client binary exercises the same HTTP/JSON contract the broker promises, including context cancellation and graceful shutdown on the client side.
+
+### What I Built
+
+- Split the single `main.go` into `cmd/broker` (the HTTP API binary), `cmd/worker` (a new Go binary that polls, "executes," and acks/fails jobs — previously this only existed as `scripts/worker_loop.sh`), `internal/db` (connection setup), and `internal/models` (shared request/response structs and the `JobState` enum).
+- Converted the broker's handlers from package-level `http.HandleFunc` closures over global state into methods on a `Server` struct (`db *sql.DB`, `jobsMu sync.Mutex`, `jobCond *sync.Cond`), constructed via `NewServer(db)`. The long-polling wakeup mechanism (`jobCond`) still holds no job state itself — only Postgres does.
+- Added `internal/testutil.NewTestDB(t)`, which opens a connection to the real Postgres instance, truncates `Jobs` and `Idems`, and registers cleanup — no mocks.
+- Wrote 13 integration tests in `cmd/broker/broker_test.go` covering enqueue→QUEUED, poll→LEASED, ack→DONE, health, `/jobs`, `/dead`, stale `lease_id` rejection on both ack and fail, expired-lease rejection on both ack and fail, fail→QUEUED with backoff, DLQ transition at `max_tries`, and `Sweep()` re-queuing expired leases directly (no need to sleep out a real lease timeout in a test).
+- Fixed a retry-loop bug in `InitDB()`: the original fatal check ran *after* a successful ping, so it could never fire, and a fully exhausted retry loop left `db` as `nil` instead of crashing loudly. The fatal check now fires on the last failed ping attempt instead.
+- Added `idx_jobs_state_next_available` on `(state, next_available_at)` — the exact pair `/poll`'s `FOR UPDATE SKIP LOCKED` query filters on.
+
+### Key Takeaway
+
+Testing a concurrency-and-locking-heavy system honestly means testing against the real database, not a mock of the interface. Getting there required removing the global state that made the handlers untestable in isolation — the `Server` struct isn't just a style preference, it's what makes `NewServer(freshTestDB)` per-test possible.
